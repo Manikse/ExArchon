@@ -50,7 +50,7 @@ class OpenRouterProvider(LLMProvider):
             return f"Kernel Error: {str(e)}"
 
 class OllamaProvider(LLMProvider):
-    def __init__(self, model="llama3", base_url="http://localhost:11434"):
+    def __init__(self, model="qwen2.5:7b", base_url="http://localhost:11434"):
         self.model = model
         self.base_url = f"{base_url}/api/generate"
 
