@@ -153,7 +153,7 @@ class ReflexSystem:
 # 2.7 SENSORY LOOP ТА EVENT BUS (ТІНЬОВИЙ КОНТЕКСТ)
 # ==========================================
 class EventBus:
-    def __init__(self):
+    def __init__(self): # ВИПРАВЛЕНО: Було init замість __init__
         self.events = []
         
     def log_event(self, source: str, data: str, severity: str = "INFO"):
@@ -188,24 +188,17 @@ async def sensory_loop(acl, console):
         with open("kernel_workspace/shadow_telemetry.log", "a", encoding="utf-8") as f:
             f.write(event_log + "\n")
 
-        if severity == "CRITICAL":
-            console.print(f"\n[bold red][ALERT] АНОМАЛІЯ СЕНСОРА: {msg}[/]")
-            console.print("[dim yellow][SYSTEM] Автономна ініціалізація Deep Path...[/]")
-            
-            crisis_prompt = f"Системна криза. Останні дані з сенсорів:\n{global_event_bus.get_shadow_context()}\nДій швидко, напиши коротке рішення проблеми."
-            
-            try:
-                response = await acl.execute(crisis_prompt, "You are an autonomous crisis manager.")
-                console.print(Panel(
-                    response, 
-                    title="[bold red]Autonomic Crisis Response (Deep Path)[/]", 
-                    border_style="red"
-                ))
-                await asyncio.sleep(10) 
-            except Exception as e:
-                console.print(f"[bold red][ERROR] Помилка кризового менеджера: {e}[/]")
-            
-            print("\033[1;32m> [Founder]: \033[0m", end="", flush=True)
+        # АЛЕРТИ ТА ДІП-ПАС ТИМЧАСОВО ВІДКЛЮЧЕНІ ДЛЯ ДЕМО
+        # if severity == "CRITICAL":
+        #     console.print(f"\n[bold red][ALERT] АНОМАЛІЯ СЕНСОРА: {msg}[/]")
+        #     console.print("[dim yellow][SYSTEM] Автономна ініціалізація Deep Path...[/]")
+        #     crisis_prompt = f"Системна криза. Останні дані з сенсорів:\n{global_event_bus.get_shadow_context()}\nДій швидко, напиши коротке рішення проблеми."
+        #     try:
+        #         response = await acl.execute(crisis_prompt, "You are an autonomous crisis manager.")
+        #         console.print(Panel(response, title="[bold red]Autonomic Crisis Response (Deep Path)[/]", border_style="red"))
+        #         await asyncio.sleep(10) 
+        #     except Exception as e:
+        #         console.print(f"[bold red][ERROR] Помилка кризового менеджера: {e}[/]")
 
 # ==========================================
 # 3. FASTAPI SERVER (ДЛЯ RAILWAY / CLOUD)

@@ -97,12 +97,12 @@ class KernelRuntime:
             # --- REFLECTION LOOP ---
             if self._is_error(task.result):
                 if current_recoveries >= self.max_recoveries:
-                    print(f"\n[ExArchon REFLECTION] 🛑 CRITICAL: Max retries reached!")
+                    print(f"\n[ExArchon REFLECTION] CRITICAL: Max retries reached!")
                     results_summary.append(f"\n[SYSTEM HALT] Max retries exceeded.")
                     break
                     
                 current_recoveries += 1
-                print(f"\n[ExArchon REFLECTION] 🚨 Error in Step {task.step_id}! Recovery initiated...")
+                print(f"\n[ExArchon REFLECTION] Error in Step {task.step_id}! Recovery initiated...")
                 
                 recovery_prompt = f"CRITICAL ALERT: Previous step failed. Error: {task.result}. Analyze and return JSON RECOVERY PLAN."
                 recovery_tasks = await self.planner.create_plan(recovery_prompt)

@@ -20,7 +20,7 @@ class TerminalDriver:
         return f"[SYSTEM INFO: OS={self.os_type}, Shell=Default, CWD={self.working_dir}]"
 
     def execute(self, command: str) -> str:
-        print(f"\n[Driver: Terminal] 💻 Виконую: '{command}'...")
+        print(f"\n[Driver: Terminal]  Виконую: '{command}'...")
         
         # Визначаємо оболонку залежно від ОС
         use_shell = True

@@ -17,8 +17,9 @@
 > 📖 **Deep Dive:** For an in-depth technical breakdown of the system's cognitive framework and execution loop, please refer to the [Architecture Documentation](docs/architecture.md).
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v0.9.0--beta-blue">
-  <img src="https://img.shields.io/badge/status-beta--hybrid-orange">
+  <img src="https://img.shields.io/badge/version-v0.10.1--alpha-blue">
+  <img src="https://img.shields.io/badge/status-bootstrapping-orange">
+  <img src="https://img.shields.io/badge/status-alpha--hybrid-orange">
   <img src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
@@ -101,24 +102,30 @@ python start.py
 - [x] **Phase 3: Cloud Nexus** - Headless REST API deployment via Railway.
 - [ ] **Phase 4: The Hybrid Edge (Current Focus)** - Local Ollama integration and latency-based fallback routing.
 - [ ] **Phase 5: Shadow Protocol** - Safe file manipulation with human-in-the-loop approvals.
-- [ ] **Phase 6: VestaStack Integration** - Full UI connection and multi-tenant memory implementation.
+- [ ] **Phase 6: VestaStack Integration** - Full UI connection and multi-tenant memory implementation
 
 ---
 
 ## Disclaimer
 
-This software is currently in **Beta release**.
+This software is currently in **Beta release**
 
-The Terminal Driver executes native commands on your host machine. While operations are sandboxed locally via the Shadow Protocol, please review generated code before executing in production environments. Do not run as root/administrator unless strictly necessary.
+The Terminal Driver executes native commands on your host machine. While operations are sandboxed locally via the Shadow Protocol, please review generated code before executing in production environments. Do not run as root/administrator unless strictly necessary
 
 ---
 
 ## Author & Support
 
-Created by **Manikse** — Building the distributed infrastructure of the future.
+Created by **Manikse** — Building the distributed infrastructure of the future
 
 <div align="center"> 
   <a href="https://ko-fi.com/manikse"> 
     <img src="https://storage.ko-fi.com/cdn/kofi3.png?v=3" width="200"/> 
   </a> 
+</div>
+
+<div align="center">
+  <a href="https://github.com/sponsors/Manikse">
+    <img src="https://img.shields.io/badge/-Sponsor%20EXARCHON-ea4aaa?style=for-the-badge&logo=github&logoColor=white" width="220" alt="Sponsor EXARCHON"/>
+  </a>
 </div>

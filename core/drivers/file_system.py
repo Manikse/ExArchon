@@ -11,7 +11,7 @@ class FileSystemDriver:
             os.makedirs(self.working_dir)
 
     def execute(self, command: str) -> str:
-        print(f"\n[Driver: {self.name}] 💾 Processing file operation...")
+        print(f"\n[Driver: {self.name}]  Processing file operation...")
         
         # Розбиваємо команду на перший рядок (дія + файл) і решту (вміст)
         lines = command.split('\n', 1)

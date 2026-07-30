@@ -6,7 +6,7 @@ import time
 class EnvManager:
     @staticmethod
     def check_ollama():
-        print("🔍 [ENV] Запуск багаторівневої діагностики системи...")
+        print(" [ENV] Запуск багаторівневої діагностики системи...")
         
         # Перевірка 1: Системний шлях (PATH) або Фізичний шлях
         print("   ├─ [1/3] Перевірка системних шляхів (Binary)...")
@@ -46,33 +46,33 @@ class EnvManager:
                 return False, "Server down"
 
             if "llama3" in result.stdout:
-                print("✅ [ENV] Діагностика успішна. Усі системи в нормі.")
+                print(" [ENV] Діагностика успішна. Усі системи в нормі.")
                 return True, "Ready"
             else:
                 return False, "Model missing"
                 
         except subprocess.TimeoutExpired:
-            print("   ❌ Сервер Ollama завис (Timeout).")
+            print("    Сервер Ollama завис (Timeout).")
             return False, "Server down"
         except Exception:
             return False, "Server down"
 
     @staticmethod
     def install_ollama():
-        print("\n📦 [INSTALLER] Ollama не знайдена в системі.")
+        print("\n [INSTALLER] Ollama не знайдена в системі.")
         print("Бажаєте встановити її автоматично через WinGet? [y/N]")
         choice = input("> ").lower()
         if choice == 'y':
-            print("🚀 Починаю встановлення...")
+            print(" Починаю встановлення...")
             try:
                 subprocess.run(["winget", "install", "-e", "--id", "Ollama.Ollama"], check=True)
-                print("✅ [INSTALLER] Ollama встановлена! ПЕРЕЗАПУСТИ ТЕРМІНАЛ, щоб система її побачила.")
+                print(" [INSTALLER] Ollama встановлена! ПЕРЕЗАПУСТИ ТЕРМІНАЛ, щоб система її побачила.")
                 return True
             except Exception as e:
-                print(f"❌ [INSTALLER] Не вдалося встановити: {e}")
+                print(f" [INSTALLER] Не вдалося встановити: {e}")
                 return False
         else:
-            print("⚠️ Встановлення скасовано користувачем.")
+            print(" Встановлення скасовано користувачем.")
             return False
 
     @staticmethod
@@ -80,10 +80,10 @@ class EnvManager:
         print("\n🤖 [MODEL] Завантажити модель Llama 3 (4.7 GB)? [y/N]")
         choice = input("> ").lower()
         if choice == 'y':
-            print("🚀 Починаю завантаження 'llama3'... Це займе час.")
+            print(" Починаю завантаження 'llama3'... Це займе час.")
             try:
                 subprocess.run(["ollama", "pull", "llama3"], check=True)
                 return True
             except Exception:
-                print("❌ [MODEL] Помилка під час завантаження.")
+                print(" [MODEL] Помилка під час завантаження.")
         return False

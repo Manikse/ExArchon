@@ -10,8 +10,8 @@ class A2AController:
         self.acl = acl
 
     async def delegate(self, agent_name: str, role: str, task: str) -> str:
-        print(f"\n[A2A Protocol] 🤖 Spawning Sub-Agent '{agent_name}'...")
-        print(f"[A2A Protocol] 🎯 Role: {role}")
+        print(f"\n[A2A Protocol]  Spawning Sub-Agent '{agent_name}'...")
+        print(f"[A2A Protocol]  Role: {role}")
         
         system_prompt = f"""
         You are an autonomous sub-agent operating under the ExArchon Kernel.
