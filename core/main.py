@@ -201,7 +201,8 @@ class KernelManager:
 
         self.kernel = KernelRuntime(
             self.acl, memory,
-            drivers={"web_search": web_search, "terminal": terminal, "file_system": file_system}
+            drivers={"web_search": web_search, "terminal": terminal, "file_system": file_system},
+            skill_db_path=os.path.join(self.config.working_dir, "skills.db")
         )
 
         self._initialized = True

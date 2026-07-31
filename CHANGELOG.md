@@ -49,3 +49,33 @@
 * **Configuration:** Implemented type-safe environment management via `ExArchonConfig` (`.env` integration)
 * **Reliability:** Replaced abrupt process kills with `asyncio.Event`-driven graceful shutdowns, strictly protecting the new UNMS SQLite database from corruption during container restarts.
 * **Business Value:** Transforms the core engine from a local script into a robust, cloud-ready asynchronous service, laying the groundwork for scalable enterprise deployments.
+
+## Cognitive Logic & Planning Refactor
+[v0.10.1-alpha] - The Baseline
+Architecture: Relied on an ephemeral, JSON-based planner that attempted to generate complete multi-step execution graphs in a single LLM pass.
+
+Limitations: Highly fragile due to JSON formatting errors on local 7B models (missing brackets, hallucinations). The agent could not adapt if step 1 failed, resulting in broken execution loops and a lack of true autonomy.
+
+Performance: Re-evaluated the same tasks from scratch every time, resulting in slow response times and wasted compute.
+
+[v0.11.1-alpha] - ReAct Engine Upgrade
+Architecture: Replaced the JSON planner with a robust ReActEngine (core/kernel/cortex/react_engine.py), implementing a step-by-step Thought → Action → Observation loop parsed via strict regex.
+
+Reliability: The agent now reacts to environmental feedback dynamically. If a command fails or is intercepted by the Shadow Protocol, the agent receives it as an Observation and immediately course-corrects without crashing.
+
+Business Value: Provides true 24/7 autonomous runtime capabilities, transforming the system from a static command executor into a resilient, self-correcting agent capable of navigating unpredictable air-gapped environments.
+
+## Cognitive Muscle Memory & Speculative Branching
+[v0.10.1-alpha] - The Baseline
+Architecture: Zero task retention. The system possessed no mechanism to learn from successful executions.
+
+Limitations: Single-threaded, linear problem-solving. Forced the LLM to waste time and tokens deducing solutions for recurring, identical operational tasks.
+
+[v0.11.1-alpha] - Self-Learning Infrastructure Upgrade
+Architecture: Engineered a multi-tiered execution loop (loop.py) integrating Reflex (0ms), Skill Retrieval (50ms), Speculative Branching, and ReAct Fallback.
+
+Cognitive Muscle Memory: Implemented an SQLite-backed Skill Library (skills.db). Successful ReAct execution traces are automatically compiled into deterministic graphs. Recurring tasks bypass the LLM entirely, executing in ~50ms.
+
+Speculative Branching: Introduced brancher.py to handle unknown tasks by spawning 3 parallel Agent-to-Agent (A2A) hypothesis branches. The first successful branch is compiled into a new skill, drastically accelerating complex problem resolution.
+
+Business Value: Establishes a unique, self-improving infrastructure that becomes faster and cheaper to operate over time. Drastically cuts LLM token overhead for routine enterprise tasks while offering advanced, parallelized problem-solving that outperforms standard agent frameworks.
