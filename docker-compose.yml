@@ -8,7 +8,11 @@ services:
       - "8000:8000"
     env_file:
       - core/.env
+
     volumes:
       - ./core/kernel_workspace:/app/kernel_workspace
       - ./core/data:/app/data
+      - exarchon_skills:/app/kernel_workspace/skills 
+    volumes:
+      exarchon_skills:
     restart: always

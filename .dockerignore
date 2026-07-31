@@ -1,6 +1,11 @@
-.venv
-__pycache__
+__pycache__/
 *.pyc
-.git
-kernel_workspace
+*.pyo
+*.pyd
+.Python
 .env
+.venv/
+venv/
+kernel_workspace/
+*.db
+*.log
