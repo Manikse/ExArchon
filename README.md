@@ -17,7 +17,7 @@
 > 📖 **Deep Dive:** For an in-depth technical breakdown of the system's cognitive framework and execution loop, please refer to the [Architecture Documentation](docs/architecture.md).
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v0.10.1--alpha-blue">
+  <img src="https://img.shields.io/badge/version-v0.11.0--alpha-blue">
   <img src="https://img.shields.io/badge/status-bootstrapping-orange">
   <img src="https://img.shields.io/badge/status-alpha--hybrid-orange">
   <img src="https://img.shields.io/badge/license-MIT-green">
