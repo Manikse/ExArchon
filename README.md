@@ -217,8 +217,4 @@ Created by **Manikse** — Building the distributed infrastructure of the future
   </a> 
 </div>
 
-<div align="center">
-  <a href="https://github.com/sponsors/Manikse">
-    <img src="https://img.shields.io/badge/-Sponsor%20EXARCHON-ea4aaa?style=for-the-badge&logo=github&logoColor=white" width="220" alt="Sponsor EXARCHON"/>
-  </a>
-</div>
+<iframe src="https://github.com/sponsors/Manikse/card" title="Sponsor Manikse" height="225" width="600" style="border: 0;"></iframe>
