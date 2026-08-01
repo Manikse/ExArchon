@@ -243,7 +243,6 @@ Ollama + EXARCHON kernel. Zero network dependency. All reasoning happens locally
 - [ ] Conditional Execution Graphs (if/else in skills)
 - [ ] Vector-based skill retrieval (embeddings)
 - [ ] Edge Mesh: distributed agent clusters
-- [ ] VestaStack UI integration
 
 ---
 

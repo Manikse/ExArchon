@@ -33,23 +33,6 @@ It is not an API wrapper. It is the core infrastructure for an AI-native operati
 
 ---
 
-## What Makes EXARCHon Different
-
-While other frameworks treat LLMs as oracles that must plan every step, EXARCHON treats intelligence as a **muscle**:
-
-| Feature | CrewAI | AutoGPT | LangGraph | **ExArchon** |
-|---------|--------|---------|-----------|--------------|
-| **Self-Learning Skills** | ❌ | ❌ | ❌ | ✅ **Muscle Memory** |
-| **Speculative Branching** | ❌ | ❌ | ❌ | ✅ **Parallel Hypotheses** |
-| **Deterministic Execution** | ❌ | ❌ | ⚠️ | ✅ **Compiled Skills** |
-| **Hybrid Edge-Cloud** | ❌ | ❌ | ❌ | ✅ **Zero-downtime Fallback** |
-| **Safe File Operations** | ❌ | ❌ | ❌ | ✅ **Shadow Protocol** |
-| **Persistent Memory** | ❌ | ❌ | ❌ | ✅ **SQLite + FTS** |
-
----
-
-## Core Architecture
-
 ### Three-Tier Cognitive Stack
 
 EXARCHON processes every request through three layers of cognition:
