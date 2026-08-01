@@ -21,6 +21,10 @@
 
 ---
 
+## Core Architecture
+
+> 📖 For an in-depth technical breakdown of the system's cognitive framework and execution loop, please refer to the [Architecture Documentation](docs/architecture.md).
+
 ## Vision
 
 The next evolution of artificial intelligence requires moving beyond conversational interfaces. EXARCHON is designed as a foundational Cognitive OS layer that bridges Large Language Models with independent, real-world execution.
