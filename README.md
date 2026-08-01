@@ -219,6 +219,6 @@ Created by **Manikse** — Building the distributed infrastructure of the future
 
 <div align="center">
   <a href="https://github.com/sponsors/Manikse">
-    <iframe src="https://github.com/sponsors/Manikse/card" title="Sponsor Manikse" height="225" width="600" style="border: 0;"></iframe>
+    <img src="https://github.com/sponsors/Manikse/card" title="Sponsor Manikse" height="225" width="600" style="border: 0;"></img>
   </a>
 </div>
