@@ -54,3 +54,4 @@ class Watchdog:
         time.sleep(2.0)
         print("[WATCHDOG] Hard exit.")
         os._exit(1)
+        
