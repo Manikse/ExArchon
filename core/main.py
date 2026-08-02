@@ -24,6 +24,7 @@ from drivers.web_search import WebSearchDriver
 from drivers.file_system import FileSystemDriver
 from kernel.unms.memory import UNMSController
 from kernel.runtime.loop import KernelRuntime
+from kernel.state_machine import StateMachine, State
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
 os.environ["PYTHONUTF8"] = "1"
