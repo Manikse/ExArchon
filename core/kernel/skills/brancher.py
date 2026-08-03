@@ -29,6 +29,12 @@ class SpeculativeBrancher:
         self.drivers = drivers
         self.memory = memory
         self.max_branches = max_branches
+        # NEW: Link to KernelRuntime
+        self.kernel_runtime = None
+
+    def attach_kernel_runtime(self, kernel_runtime):
+        """Attach to parent KernelRuntime for capability validation."""
+        self.kernel_runtime = kernel_runtime
 
     async def solve(self, user_input: str, session_id: str = "default") -> Optional[ReActTrace]:
         """
@@ -67,6 +73,10 @@ class SpeculativeBrancher:
         adapted_input = f"Original task: {original_input}\nApproach: {hypothesis}"
 
         engine = ReactEngine(self.acl, self.drivers, memory=self.memory)
+        # NEW: Pass kernel runtime to internal ReactEngine
+        if self.kernel_runtime:
+            engine.attach_kernel_runtime(self.kernel_runtime)
+
         trace = await engine.run(adapted_input, session_id=f"{session_id}_branch")
 
         elapsed_ms = (time.time() - start) * 1000

@@ -20,13 +20,11 @@ from pydantic import BaseModel
 import uvicorn
 
 from drivers.terminal import TerminalDriver
-# NOTE: WebSearch moved to integrations/ — not part of kernel core
-# from drivers.web_search import WebSearchDriver
 from drivers.file_system import FileSystemDriver
 from kernel.unms.memory import UNMSController
 from kernel.runtime.loop import KernelRuntime
 from kernel.state_machine import StateMachine, State
-from kernel.watchdog import Watchdog
+from kernel.notice_system import NoticeSystem, NoticeBoard, NoticeSeverity, thermal_aggregator, skill_aggregator
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
 os.environ["PYTHONUTF8"] = "1"
@@ -106,12 +104,16 @@ class OllamaProvider(LLMProvider):
         payload = {"model": self.model, "prompt": full_prompt, "stream": False, "options": {"temperature": 0.2}}
         try:
             loop = asyncio.get_event_loop()
+            # 60s timeout for Ollama (enough for 7B model on decent hardware)
             response = await loop.run_in_executor(
                 None,
-                lambda: requests.post(self.base_url, json=payload, timeout=300)
+                lambda: requests.post(self.base_url, json=payload, timeout=60)
             )
             response.raise_for_status()
             return response.json().get("response", "Error: Empty response.")
+        except requests.Timeout:
+            self.logger.warning("Ollama request timed out after 60s")
+            return "Kernel Error: Ollama timeout (60s). Model may be too slow or overloaded."
         except Exception as e:
             self.logger.warning(f"Ollama error: {e}")
             return f"Kernel Error: {str(e)}"
@@ -125,6 +127,7 @@ class ACLController:
         self.primary_status = "UNKNOWN"
         self._lock = asyncio.Lock()
         self.logger = logging.getLogger("ACLController")
+        self._fallback_logged = False  # NEW: log fallback only once
 
     def register_provider(self, name: str, provider: LLMProvider, is_primary=False):
         self.providers[name] = provider
@@ -142,19 +145,33 @@ class ACLController:
             self.logger.warning(f"Primary provider {self.primary} health check failed")
             return False
         self.primary_status = "ONLINE"
+        self._fallback_logged = False  # Reset on success
         return True
 
     async def execute(self, prompt: str, system_prompt: str = "") -> str:
         sys_prompt = system_prompt or "You are ExArchon, a Cognitive OS."
         async with self._lock:
+            # Try primary
             if self.primary and self.primary_status == "ONLINE":
                 result = await self.providers[self.primary].generate(prompt, sys_prompt)
                 if "Kernel Error" not in result:
                     return result
                 self.logger.warning(f"Primary {self.primary} failed, trying backup...")
-            if self.backup:
-                self.logger.info(f"Falling back to backup: {self.backup}")
+
+            # Try backup (only if different from primary)
+            if self.backup and self.backup != self.primary:
+                if not self._fallback_logged:
+                    self.logger.info(f"Falling back to backup: {self.backup}")
+                    self._fallback_logged = True
                 return await self.providers[self.backup].generate(prompt, sys_prompt)
+
+            # Backup is same as primary (e.g., only Ollama configured)
+            if self.backup and self.backup == self.primary:
+                if not self._fallback_logged:
+                    self.logger.info(f"Using single provider: {self.backup}")
+                    self._fallback_logged = True
+                return await self.providers[self.backup].generate(prompt, sys_prompt)
+
             return "CRITICAL ERROR: All cognitive centers offline."
 
 
@@ -162,7 +179,6 @@ class ACLController:
 # 2. KERNEL MANAGER
 # ==========================================
 class KernelManager:
-    """Single source of truth for ExArchon state."""
     def __init__(self, config: ExArchonConfig):
         self.config = config
         self.acl: Optional[ACLController] = None
@@ -170,17 +186,9 @@ class KernelManager:
         self.event_bus = EventBus()
         self.logger = logging.getLogger("KernelManager")
         self._initialized = False
-        # NEW: Watchdog — last resort protection
-        self.watchdog = Watchdog(timeout_sec=5.0, on_timeout=self._on_watchdog_timeout)
-
-    def _on_watchdog_timeout(self):
-        """Watchdog triggered → force SAFE mode."""
-        self.logger.critical("WATCHDOG TIMEOUT — Entering SAFE mode")
-        if self.kernel and hasattr(self.kernel, "state_machine"):
-            try:
-                self.kernel.state_machine.transition(State.SAFE)
-            except Exception:
-                pass
+        self.notice_system = NoticeSystem()
+        self.notice_system.register_aggregator("sensory", thermal_aggregator)
+        self.notice_system.register_aggregator("cortex", skill_aggregator)
 
     async def init(self) -> str:
         if self._initialized:
@@ -210,8 +218,6 @@ class KernelManager:
 
         memory = UNMSController(db_path=os.path.join(self.config.working_dir, "unms.db"))
         file_system = FileSystemDriver(working_dir=self.config.working_dir)
-        # NOTE: WebSearch is an integration, not a kernel driver
-        # web_search = WebSearchDriver()
         terminal = TerminalDriver(working_dir=self.config.working_dir)
 
         self.kernel = KernelRuntime(
@@ -221,13 +227,16 @@ class KernelManager:
         )
 
         self._initialized = True
-        self.watchdog.start()
         self.logger.info(f"Kernel initialized. ACL: {status_acl}")
         return status_acl
 
     async def shutdown(self):
         self.logger.info("Kernel manager shutting down...")
-        self.watchdog.stop()
+        if self.kernel and hasattr(self.kernel, "shutdown"):
+            try:
+                self.kernel.shutdown()
+            except Exception as e:
+                self.logger.warning(f"Kernel runtime shutdown error: {e}")
         if self.kernel and hasattr(self.kernel, "memory"):
             try:
                 self.kernel.memory.cleanup_stale_sessions()
@@ -280,7 +289,6 @@ class EventBus:
 
 
 async def sensory_loop(manager: KernelManager, console, shutdown_event: asyncio.Event):
-    """Sensory loop with state-aware thermal management."""
     os.makedirs("kernel_workspace", exist_ok=True)
     logger = logging.getLogger("SensoryLoop")
 
@@ -292,24 +300,12 @@ async def sensory_loop(manager: KernelManager, console, shutdown_event: asyncio.
             pass
 
         sensor_temp = 20 + random.randint(-5, 15)
-        severity = "CRITICAL" if sensor_temp > 33 else "INFO"
-        msg = f"Core temp: {sensor_temp}C"
-        event_log = f"[{time.ctime()}] [{severity}] SENSOR_THERMAL: {msg}"
-
-        # NEW: State-aware thermal management
-        if sensor_temp > 33 and manager.kernel and hasattr(manager.kernel, "state_machine"):
-            logger.critical(f"THERMAL CRITICAL: {sensor_temp}C — Triggering RECOVERY")
-            try:
-                manager.kernel.state_machine.transition(State.RECOVERY)
-            except Exception:
-                try:
-                    manager.kernel.state_machine.transition(State.SAFE)
-                except Exception:
-                    pass
+        raw_event = f"Core temp: {sensor_temp}C"
+        manager.notice_system.feed_raw("sensory", raw_event)
 
         try:
             with open("kernel_workspace/shadow_telemetry.log", "a", encoding="utf-8") as f:
-                f.write(event_log + "\n")
+                f.write(f"[{time.ctime()}] SENSOR_THERMAL: {raw_event}\n")
         except Exception as e:
             logger.warning(f"Telemetry write failed: {e}")
 
@@ -370,27 +366,37 @@ async def interactive_repl(console, manager: KernelManager, shutdown_event: asyn
                 continue
 
             if user_input.lower() in ["exit", "quit", "вихід"]:
-                # NEW: Graceful shutdown via state machine
-                if manager.kernel and hasattr(manager.kernel, "state_machine"):
-                    try:
-                        manager.kernel.state_machine.transition(State.SHUTDOWN)
-                        console.print(f"\n[dim][STATE] {manager.kernel.state_machine.state.name}[/dim]")
-                    except Exception:
-                        pass
                 console.print("\n[bold red][SYSTEM] Відключення систем. До зустрічі, Архітекторе.[/]")
                 shutdown_event.set()
                 break
 
+            if user_input.lower() in ["notices", "нотиси", "статус"]:
+                board_str = manager.notice_system.get_board().to_console_string(count=10)
+                console.print("\n")
+                console.print(Panel(
+                    board_str,
+                    title="[bold bright_yellow]Notice Board[/]",
+                    border_style="bright_yellow",
+                    padding=(1, 2)
+                ))
+                console.print("\n")
+                continue
+
+            if user_input.lower() in ["bg", "background", "фон"]:
+                if manager.kernel and hasattr(manager.kernel, "get_background_status"):
+                    bg_status = manager.kernel.get_background_status()
+                    console.print("\n")
+                    console.print(Panel(
+                        bg_status,
+                        title="[bold bright_magenta]Background Workers[/]",
+                        border_style="bright_magenta",
+                        padding=(1, 2)
+                    ))
+                    console.print("\n")
+                continue
+
             fast_response = reflexes.check(user_input)
             if fast_response:
-                # NEW: Formal REFLEX state transition
-                if manager.kernel and hasattr(manager.kernel, "state_machine"):
-                    try:
-                        manager.kernel.state_machine.transition(State.REFLEX)
-                        console.print(f"\n[dim][STATE] {manager.kernel.state_machine.state.name}[/dim]")
-                    except Exception:
-                        pass
-
                 console.print("\n")
                 console.print(Panel(
                     fast_response,
@@ -399,14 +405,6 @@ async def interactive_repl(console, manager: KernelManager, shutdown_event: asyn
                     padding=(1, 2)
                 ))
                 console.print("\n")
-
-                # NEW: Return to IDLE
-                if manager.kernel and hasattr(manager.kernel, "state_machine"):
-                    try:
-                        manager.kernel.state_machine.transition(State.IDLE)
-                        console.print(f"[dim][STATE] {manager.kernel.state_machine.state.name}[/dim]")
-                    except Exception:
-                        pass
                 continue
 
             with console.status("[bold cyan]ExArchon is processing (Deep Path)...", spinner="bouncingBar"):
@@ -423,8 +421,10 @@ async def interactive_repl(console, manager: KernelManager, shutdown_event: asyn
             console.print("\n")
 
         except KeyboardInterrupt:
-            shutdown_event.set()
-            break
+            console.print("\n[bold yellow][SYSTEM] Interrupted. Use 'exit' to quit properly.[/]")
+            continue
+
+    shutdown_event.set()
 
 
 async def local_cli_main():
@@ -449,8 +449,10 @@ async def local_cli_main():
     console.print(logo)
     console.print(Panel(
         f"● [bold white]ACL Layer:[/] {status_acl}\n"
-        f"● [bold white]Kernel:[/] READY\n"
+        f"● [bold white]Kernel:[/] READY (Raphael Edition)\n"
         f"● [bold white]Reflex System:[/] ONLINE\n"
+        f"● [bold white]Notice System:[/] ACTIVE\n"
+        f"● [bold white]Background Workers:[/] ACTIVE\n"
         f"● [bold white]Sensory Loop:[/] ACTIVE",
         title="[bold white]System Status[/]",
         border_style="dim",
@@ -468,6 +470,8 @@ async def local_cli_main():
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
         pass
+    except Exception as e:
+        logging.getLogger("Main").error(f"Fatal error: {e}")
     finally:
         await manager.shutdown()
         console.print("\n[dim]ExArchon shutdown complete.[/dim]")

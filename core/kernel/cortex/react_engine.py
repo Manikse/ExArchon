@@ -7,6 +7,8 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Callable
 
+from kernel.state_machine import Action
+
 
 @dataclass
 class CortexStep:
@@ -72,12 +74,17 @@ Action Input: current weather
 Now solve the user's request.
 """.strip()
 
-    def __init__(self, acl, drivers: Dict[str, Callable], memory=None, max_iterations: int = 10):
+    def __init__(self, acl, drivers: Dict[str, Callable], memory=None, max_iterations: int = 5):
         self.acl = acl
         self.drivers = drivers
         self.memory = memory
         self.max_iterations = max_iterations
         self.tool_names = set(drivers.keys()) | {"respond"}
+        self.kernel_runtime = None
+
+    def attach_kernel_runtime(self, kernel_runtime):
+        """Attach to parent KernelRuntime for capability validation."""
+        self.kernel_runtime = kernel_runtime
 
     async def run(self, user_input: str, session_id: str = "default") -> ReActTrace:
         """
@@ -88,25 +95,19 @@ Now solve the user's request.
         history = []
 
         for i in range(self.max_iterations):
-            # Будуємо prompt
             prompt = self._build_prompt(user_input, history)
-
-            # Запит до LLM
             raw = await self.acl.execute(prompt, system_prompt=self.FEW_SHOT_PROMPT)
 
-            # Парсимо
             step = self._parse_response(raw)
             step.raw_response = raw
 
             if not step.action:
-                # LLM згенерував щось незрозуміле — fallback
                 step.action = "respond"
                 step.action_input = (
                     f"[Cortex Error] Could not parse action from LLM response."
                     f"Raw: {raw[:500]}"
                 )
 
-            # Виконуємо дію
             if step.action == "respond":
                 trace.success = True
                 trace.final_answer = step.action_input
@@ -117,7 +118,6 @@ Now solve the user's request.
             step.observation = observation
             trace.steps.append(step)
 
-            # Додаємо в історію для наступного кроку
             history.append({
                 "thought": step.thought,
                 "action": step.action,
@@ -126,14 +126,12 @@ Now solve the user's request.
             })
 
         else:
-            # Досягли max_iterations
             trace.success = False
             trace.final_answer = (
                 f"[Cortex] Max iterations ({self.max_iterations}) reached. "
                 f"Partial result after {len(trace.steps)} steps."
             )
 
-        # Зберігаємо в UNMS якщо є
         if self.memory:
             self.memory.add_interaction(
                 session_id,
@@ -145,44 +143,33 @@ Now solve the user's request.
         return trace
 
     def _build_prompt(self, user_input: str, history: List[Dict]) -> str:
-        """Будує prompt для LLM з історією кроків."""
         lines = [f"User: {user_input}", ""]
-
         for h in history:
             lines.append(f"Thought: {h['thought']}")
             lines.append(f"Action: {h['action']}")
             lines.append(f"Action Input: {h['action_input']}")
             lines.append(f"Observation: {h['observation']}")
             lines.append("")
-
         lines.append("What is your next Thought, Action, and Action Input?")
-        return "\\n".join(lines)
+        return "\n".join(lines)
 
     def _parse_response(self, raw: str) -> CortexStep:
-        """
-        Парсить відповідь LLM на Thought, Action, Action Input.
-        Набагато надійніше за JSON.
-        """
         thought = ""
         action = ""
         action_input = ""
 
-        # Thought
         m_thought = re.search(r"Thought:\s*(.+?)(?=\nAction:|$)", raw, re.DOTALL | re.IGNORECASE)
         if m_thought:
             thought = m_thought.group(1).strip()
 
-        # Action
         m_action = re.search(r"Action:\s*(\w+)", raw, re.IGNORECASE)
         if m_action:
             action = m_action.group(1).strip().lower()
 
-        # Action Input — беремо все до кінця рядка або блоку
         m_input = re.search(r"Action Input:\s*(.+?)(?=\nThought:|\nAction:|$)", raw, re.DOTALL | re.IGNORECASE)
         if m_input:
             action_input = m_input.group(1).strip()
 
-        # Валідація action
         if action not in self.tool_names:
             action = ""
             action_input = raw[:1000]
@@ -194,9 +181,13 @@ Now solve the user's request.
         )
 
     async def _execute_action(self, step: CortexStep) -> str:
-        """Виконує дію через відповідний driver."""
         if step.action not in self.drivers:
             return f"[Error] Unknown tool: {step.action}. Available: {sorted(self.tool_names)}"
+
+        if self.kernel_runtime:
+            action = Action(op="EXEC", target=step.action_input, source_agent="cortex")
+            if not self.kernel_runtime._check_capability(step.action, action):
+                return "[Error] Capability denied by kernel"
 
         driver = self.drivers[step.action]
 
@@ -205,7 +196,6 @@ Now solve the user's request.
                 result = await driver(step.action_input)
             else:
                 result = driver(step.action_input)
-            return str(result)[:2000]  # truncate
+            return str(result)[:2000]
         except Exception as e:
             return f"[Execution Error] {str(e)}"
-        
