@@ -20,11 +20,13 @@ from pydantic import BaseModel
 import uvicorn
 
 from drivers.terminal import TerminalDriver
-from drivers.web_search import WebSearchDriver
+# NOTE: WebSearch moved to integrations/ — not part of kernel core
+# from drivers.web_search import WebSearchDriver
 from drivers.file_system import FileSystemDriver
 from kernel.unms.memory import UNMSController
 from kernel.runtime.loop import KernelRuntime
 from kernel.state_machine import StateMachine, State
+from kernel.watchdog import Watchdog
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
 os.environ["PYTHONUTF8"] = "1"
@@ -157,7 +159,7 @@ class ACLController:
 
 
 # ==========================================
-# 2. KERNEL MANAGER (replaces globals)
+# 2. KERNEL MANAGER
 # ==========================================
 class KernelManager:
     """Single source of truth for ExArchon state."""
@@ -168,6 +170,17 @@ class KernelManager:
         self.event_bus = EventBus()
         self.logger = logging.getLogger("KernelManager")
         self._initialized = False
+        # NEW: Watchdog — last resort protection
+        self.watchdog = Watchdog(timeout_sec=5.0, on_timeout=self._on_watchdog_timeout)
+
+    def _on_watchdog_timeout(self):
+        """Watchdog triggered → force SAFE mode."""
+        self.logger.critical("WATCHDOG TIMEOUT — Entering SAFE mode")
+        if self.kernel and hasattr(self.kernel, "state_machine"):
+            try:
+                self.kernel.state_machine.transition(State.SAFE)
+            except Exception:
+                pass
 
     async def init(self) -> str:
         if self._initialized:
@@ -197,21 +210,24 @@ class KernelManager:
 
         memory = UNMSController(db_path=os.path.join(self.config.working_dir, "unms.db"))
         file_system = FileSystemDriver(working_dir=self.config.working_dir)
-        web_search = WebSearchDriver()
+        # NOTE: WebSearch is an integration, not a kernel driver
+        # web_search = WebSearchDriver()
         terminal = TerminalDriver(working_dir=self.config.working_dir)
 
         self.kernel = KernelRuntime(
             self.acl, memory,
-            drivers={"web_search": web_search, "terminal": terminal, "file_system": file_system},
+            drivers={"terminal": terminal, "file_system": file_system},
             skill_db_path=os.path.join(self.config.working_dir, "skills.db")
         )
 
         self._initialized = True
+        self.watchdog.start()
         self.logger.info(f"Kernel initialized. ACL: {status_acl}")
         return status_acl
 
     async def shutdown(self):
         self.logger.info("Kernel manager shutting down...")
+        self.watchdog.stop()
         if self.kernel and hasattr(self.kernel, "memory"):
             try:
                 self.kernel.memory.cleanup_stale_sessions()
@@ -263,7 +279,8 @@ class EventBus:
         return "\n".join(self.events[-10:])
 
 
-async def sensory_loop(acl, console, shutdown_event: asyncio.Event):
+async def sensory_loop(manager: KernelManager, console, shutdown_event: asyncio.Event):
+    """Sensory loop with state-aware thermal management."""
     os.makedirs("kernel_workspace", exist_ok=True)
     logger = logging.getLogger("SensoryLoop")
 
@@ -278,6 +295,17 @@ async def sensory_loop(acl, console, shutdown_event: asyncio.Event):
         severity = "CRITICAL" if sensor_temp > 33 else "INFO"
         msg = f"Core temp: {sensor_temp}C"
         event_log = f"[{time.ctime()}] [{severity}] SENSOR_THERMAL: {msg}"
+
+        # NEW: State-aware thermal management
+        if sensor_temp > 33 and manager.kernel and hasattr(manager.kernel, "state_machine"):
+            logger.critical(f"THERMAL CRITICAL: {sensor_temp}C — Triggering RECOVERY")
+            try:
+                manager.kernel.state_machine.transition(State.RECOVERY)
+            except Exception:
+                try:
+                    manager.kernel.state_machine.transition(State.SAFE)
+                except Exception:
+                    pass
 
         try:
             with open("kernel_workspace/shadow_telemetry.log", "a", encoding="utf-8") as f:
@@ -342,12 +370,27 @@ async def interactive_repl(console, manager: KernelManager, shutdown_event: asyn
                 continue
 
             if user_input.lower() in ["exit", "quit", "вихід"]:
+                # NEW: Graceful shutdown via state machine
+                if manager.kernel and hasattr(manager.kernel, "state_machine"):
+                    try:
+                        manager.kernel.state_machine.transition(State.SHUTDOWN)
+                        console.print(f"\n[dim][STATE] {manager.kernel.state_machine.state.name}[/dim]")
+                    except Exception:
+                        pass
                 console.print("\n[bold red][SYSTEM] Відключення систем. До зустрічі, Архітекторе.[/]")
                 shutdown_event.set()
                 break
 
             fast_response = reflexes.check(user_input)
             if fast_response:
+                # NEW: Formal REFLEX state transition
+                if manager.kernel and hasattr(manager.kernel, "state_machine"):
+                    try:
+                        manager.kernel.state_machine.transition(State.REFLEX)
+                        console.print(f"\n[dim][STATE] {manager.kernel.state_machine.state.name}[/dim]")
+                    except Exception:
+                        pass
+
                 console.print("\n")
                 console.print(Panel(
                     fast_response,
@@ -356,6 +399,14 @@ async def interactive_repl(console, manager: KernelManager, shutdown_event: asyn
                     padding=(1, 2)
                 ))
                 console.print("\n")
+
+                # NEW: Return to IDLE
+                if manager.kernel and hasattr(manager.kernel, "state_machine"):
+                    try:
+                        manager.kernel.state_machine.transition(State.IDLE)
+                        console.print(f"[dim][STATE] {manager.kernel.state_machine.state.name}[/dim]")
+                    except Exception:
+                        pass
                 continue
 
             with console.status("[bold cyan]ExArchon is processing (Deep Path)...", spinner="bouncingBar"):
@@ -391,7 +442,7 @@ async def local_cli_main():
     | ____| \ \ / /  / _ \  |  _ \  / ___| | | | |  / _ \  | \ | |
     |  _|    \ V /  / /_\ \ | |_) | | |    | |_| | | | | | |  \| |
     | |___    > <   |  _  | |  _ <  | |___ |  _  | | |_| | | |\  |
-    |_____|  /_/ \_\|_| |_| |_| \_\  \____||_| |_|  \___/  |_| \_|
+    |_____|  /_/ \__\|_| |_| |_| \__\  \____||_| |_|  \___/  |_| \_|
     [white]EXARCHON COGNITIVE OS LAYER // ALPHA v0.9.5[/white]
     [/bold cyan]
     """
@@ -410,7 +461,7 @@ async def local_cli_main():
 
     tasks = []
     if config.enable_sensory_loop:
-        tasks.append(asyncio.create_task(sensory_loop(manager.acl, console, shutdown_event)))
+        tasks.append(asyncio.create_task(sensory_loop(manager, console, shutdown_event)))
     tasks.append(asyncio.create_task(interactive_repl(console, manager, shutdown_event)))
 
     try:
