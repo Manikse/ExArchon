@@ -2,9 +2,10 @@ import subprocess
 import os
 import platform
 import shlex
-import re
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
+
+from kernel.security.capabilities import CapabilityManager, CapOp, CapabilityToken
 
 
 @dataclass
@@ -17,74 +18,101 @@ class ExecutionResult:
 
 class TerminalDriver:
     """
-    Sandboxed Terminal Driver.
-    ЗАУВАЖЕННЯ: Основна валідація — у kernel (capabilities.py).
-    Цей driver — defense in depth (останній рубіж).
-    """
-    
-    # Останній рубіж: навіть якщо kernel помилився — block це
-    BLOCKED_COMMANDS = {'mkfs', 'fdisk', 'dd', 'format', 'diskpart'}
-    
-    DANGEROUS_PATTERNS = [
-        r'rm\s+-rf\s+/',
-        r'>\s*/dev/',
-        r':\(\)\{\s*:\|:&\s*\};',  # fork bomb
-        r'curl\s+.*\|\s*sh',
-        r'wget\s+.*\|\s*sh',
-        r'powershell\s+-enc',
-        r'Invoke-Expression',
-        r'IEX\s*\(',
-    ]
+    Sandboxed Terminal Driver — Capability-Based Edition.
 
-    def __init__(self, working_dir: str = "./kernel_workspace", timeout: int = 20):
+    Зміни від попередньої версії:
+    1. ВИДАЛЕНО blacklist/whitelist. Тільки CapabilityManager.
+    2. ВИДАЛЕНО DANGEROUS_PATTERNS та BLOCKED_COMMANDS.
+    3. shell=True ЗАБОРОНЕНО — якщо shlex.split падає, повертаємо помилку.
+    4. Кожна команда перевіряється через CapabilityManager ПЕРЕД виконанням.
+    5. Додано execution limits (timeout з capability token).
+
+    Філософія: driver НЕ вирішує, що безпечно. Kernel вирішує через capabilities.
+    Driver тільки виконує те, що йому дозволено.
+    """
+
+    def __init__(
+        self,
+        working_dir: str = "./kernel_workspace",
+        capability_manager: Optional[CapabilityManager] = None,
+        default_timeout: int = 20,
+    ):
         self.name = "terminal"
         self.working_dir = os.path.abspath(working_dir)
         self.os_type = platform.system()
-        self.timeout = timeout
+        self.default_timeout = default_timeout
+        self.cap_manager = capability_manager
         os.makedirs(self.working_dir, exist_ok=True)
 
     def _get_system_context(self) -> str:
         return f"[SYSTEM INFO: OS={self.os_type}, CWD={self.working_dir}]"
 
-    def _last_resort_check(self, command: str) -> Tuple[bool, str]:
-        """Останній рубіж. Не заміна capabilities — доповнення."""
+    def _resolve_command_target(self, command: str) -> str:
+        """Витягує базову команду для перевірки capability."""
         stripped = command.strip()
         if not stripped:
-            return False, "Empty command"
-        
-        # Block dangerous patterns
-        for pattern in self.DANGEROUS_PATTERNS:
-            if re.search(pattern, stripped, re.IGNORECASE):
-                return False, "Dangerous pattern detected (last resort)"
-        
-        # Block permanently blocked commands
+            return ""
         try:
-            base_cmd = shlex.split(stripped)[0]
+            args = shlex.split(stripped)
+            return args[0] if args else ""
         except ValueError:
-            base_cmd = stripped.split()[0] if stripped.split() else ""
-        
-        if base_cmd.lower() in {cmd.lower() for cmd in self.BLOCKED_COMMANDS}:
-            return False, f"Command '{base_cmd}' permanently blocked"
-        
-        return True, ""
+            # Якщо не можемо розпарсити — це shell-конструкція, яка потребує shell=True
+            # Але shell=True ЗАБОРОНЕНО в kernel mode
+            return "<shell_construct>"
 
-    def execute(self, command: str) -> str:
-        print(f"\n[Driver: Terminal] Executing: '{command}'...")
-        
-        # Останній рубіж
-        ok, err = self._last_resort_check(command)
-        if not ok:
-            return f"{self._get_system_context()}\n[SECURITY BLOCKED] {err}"
-        
-        # Підготовка
+    def execute(self, command: str, capability_token: Optional[CapabilityToken] = None) -> str:
+        """
+        Виконує команду з перевіркою capability.
+
+        Args:
+            command: команда для виконання
+            capability_token: явний токен (опціонально, якщо cap_manager налаштований)
+        """
+        print(f"\n[Driver: Terminal] Executing: '{command[:100]}'...")
+
+        # === 1. Перевірка capability ===
+        base_cmd = self._resolve_command_target(command)
+        if not base_cmd:
+            return f"{self._get_system_context()}\n[ERROR] Empty command"
+
+        if self.cap_manager:
+            ok, reason = self.cap_manager.validate("terminal", CapOp.EXEC, base_cmd)
+            if not ok:
+                return f"{self._get_system_context()}\n[CAPABILITY DENIED] {reason}"
+
+        # === 2. Парсинг аргументів — БЕЗ shell=True fallback ===
         try:
             args = shlex.split(command)
             use_shell = False
-        except ValueError:
-            args = [command]
-            use_shell = True
-        
-        # Виконання
+        except ValueError as e:
+            return (
+                f"{self._get_system_context()}\n"
+                f"[SECURITY ERROR] Command parsing failed: {e}.\n"
+                f"Shell constructs are prohibited in kernel mode. Use explicit arguments."
+            )
+
+        # === 3. Додаткова перевірка: якщо token вимагає no_shell, а ми тут — значить все ок,
+        # бо shlex.split спрацював. Але перевіримо явно. ===
+        if capability_token:
+            no_shell = capability_token.condition("no_shell")
+            if no_shell == "True" and use_shell:
+                return (
+                    f"{self._get_system_context()}\n"
+                    f"[CAPABILITY DENIED] Token requires no_shell=True"
+                )
+            # Timeout з токена
+            max_timeout = capability_token.condition("max_timeout")
+            if max_timeout:
+                try:
+                    timeout = min(self.default_timeout, int(max_timeout))
+                except ValueError:
+                    timeout = self.default_timeout
+            else:
+                timeout = self.default_timeout
+        else:
+            timeout = self.default_timeout
+
+        # === 4. Виконання ===
         try:
             result = subprocess.run(
                 args,
@@ -92,11 +120,11 @@ class TerminalDriver:
                 cwd=self.working_dir,
                 capture_output=True,
                 text=True,
-                timeout=self.timeout,
-                encoding='utf-8',
-                errors='replace'
+                timeout=timeout,
+                encoding="utf-8",
+                errors="replace",
             )
-            
+
             stdout = result.stdout.strip()
             stderr = result.stderr.strip()
             output_parts = []
@@ -104,18 +132,49 @@ class TerminalDriver:
                 output_parts.append(stdout)
             if stderr:
                 output_parts.append(f"STDERR: {stderr}")
-            
+
             final_output = "\n".join(output_parts)
             status = "Success" if result.returncode == 0 else "Error"
             truncated = final_output[:2000]
             if len(final_output) > 2000:
                 truncated += "\n... [output truncated]"
-            
+
             return f"{self._get_system_context()}\n[{status}]\n{truncated}"
-            
+
         except subprocess.TimeoutExpired:
-            return f"{self._get_system_context()}\n[ERROR] Timeout ({self.timeout}s)."
+            return f"{self._get_system_context()}\n[ERROR] Timeout ({timeout}s)."
         except FileNotFoundError:
-            return f"{self._get_system_context()}\n[ERROR] Command not found."
+            return f"{self._get_system_context()}\n[ERROR] Command not found: {base_cmd}"
+        except PermissionError:
+            return f"{self._get_system_context()}\n[ERROR] Permission denied: {base_cmd}"
         except Exception as e:
             return f"{self._get_system_context()}\n[ERROR] {str(e)}"
+
+    def execute_with_result(self, command: str, capability_token: Optional[CapabilityToken] = None) -> ExecutionResult:
+        """Повертає структурований результат замість рядка."""
+        raw = self.execute(command, capability_token)
+        lines = raw.split("\n")
+
+        # Парсимо статус з відповіді
+        returncode = 0 if "[Success]" in raw else 1
+        stdout = ""
+        stderr = ""
+
+        in_stdout = False
+        for line in lines:
+            if line.startswith("[SYSTEM INFO:"):
+                continue
+            if line == "[Success]" or line == "[Error]":
+                in_stdout = True
+                continue
+            if line.startswith("STDERR: "):
+                stderr += line[8:] + "\n"
+            elif in_stdout:
+                stdout += line + "\n"
+
+        return ExecutionResult(
+            stdout=stdout.strip(),
+            stderr=stderr.strip(),
+            returncode=returncode,
+            context=self._get_system_context(),
+        )

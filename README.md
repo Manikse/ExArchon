@@ -14,7 +14,7 @@
 ---
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v0.11.1--alpha-blue">
+  <img src="https://img.shields.io/badge/version-v0.11.3--alpha-blue">
   <img src="https://img.shields.io/badge/status-alpha--hybrid-orange">
   <img src="https://img.shields.io/badge/license-MIT-green">
 </p>
