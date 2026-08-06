@@ -5,6 +5,8 @@ import requests
 import time
 import random
 import logging
+import argparse
+import signal
 from dotenv import load_dotenv
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -25,6 +27,8 @@ from kernel.unms.memory import UNMSController
 from kernel.runtime.loop import KernelRuntime
 from kernel.state_machine import StateMachine, State
 from kernel.notice_system import NoticeSystem, NoticeBoard, NoticeSeverity, thermal_aggregator, skill_aggregator
+from kernel.watchdog import SystemWatchdog
+from kernel.security.capabilities import CapabilityManager, make_terminal_caps, make_filesystem_caps
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
 os.environ["PYTHONUTF8"] = "1"
@@ -49,17 +53,22 @@ class ExArchonConfig:
     working_dir: str = "./kernel_workspace"
     log_level: str = "INFO"
     enable_sensory_loop: bool = True
+    enable_watchdog: bool = True
+    state_journal_path: str = "./kernel_workspace/state.journal"
 
     @classmethod
     def from_env(cls) -> "ExArchonConfig":
         load_dotenv()
+        wd = os.getenv("WORKING_DIR", "./kernel_workspace")
         return cls(
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY") or os.getenv("GOOGLE_API_KEY"),
             ollama_model=os.getenv("OLLAMA_MODEL", "qwen2.5:7b"),
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-            working_dir=os.getenv("WORKING_DIR", "./kernel_workspace"),
+            working_dir=wd,
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             enable_sensory_loop=os.getenv("ENABLE_SENSORY_LOOP", "true").lower() == "true",
+            enable_watchdog=os.getenv("ENABLE_WATCHDOG", "true").lower() == "true",
+            state_journal_path=os.getenv("STATE_JOURNAL", os.path.join(wd, "state.journal")),
         )
 
 
@@ -73,7 +82,7 @@ class LLMProvider(ABC):
 
 
 class OpenRouterProvider(LLMProvider):
-    def __init__(self, api_key: str, model: str = "google/gemini-2.0-flash-001"):
+    def __init__(self, api_key: str, model: str = "openai/gpt-4o-mini"):
         self.client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
         self.model = model
         self.logger = logging.getLogger("OpenRouterProvider")
@@ -104,7 +113,6 @@ class OllamaProvider(LLMProvider):
         payload = {"model": self.model, "prompt": full_prompt, "stream": False, "options": {"temperature": 0.2}}
         try:
             loop = asyncio.get_event_loop()
-            # 60s timeout for Ollama (enough for 7B model on decent hardware)
             response = await loop.run_in_executor(
                 None,
                 lambda: requests.post(self.base_url, json=payload, timeout=60)
@@ -127,7 +135,7 @@ class ACLController:
         self.primary_status = "UNKNOWN"
         self._lock = asyncio.Lock()
         self.logger = logging.getLogger("ACLController")
-        self._fallback_logged = False  # NEW: log fallback only once
+        self._fallback_logged = False
 
     def register_provider(self, name: str, provider: LLMProvider, is_primary=False):
         self.providers[name] = provider
@@ -145,27 +153,24 @@ class ACLController:
             self.logger.warning(f"Primary provider {self.primary} health check failed")
             return False
         self.primary_status = "ONLINE"
-        self._fallback_logged = False  # Reset on success
+        self._fallback_logged = False
         return True
 
     async def execute(self, prompt: str, system_prompt: str = "") -> str:
         sys_prompt = system_prompt or "You are ExArchon, a Cognitive OS."
         async with self._lock:
-            # Try primary
             if self.primary and self.primary_status == "ONLINE":
                 result = await self.providers[self.primary].generate(prompt, sys_prompt)
                 if "Kernel Error" not in result:
                     return result
                 self.logger.warning(f"Primary {self.primary} failed, trying backup...")
 
-            # Try backup (only if different from primary)
             if self.backup and self.backup != self.primary:
                 if not self._fallback_logged:
                     self.logger.info(f"Falling back to backup: {self.backup}")
                     self._fallback_logged = True
                 return await self.providers[self.backup].generate(prompt, sys_prompt)
 
-            # Backup is same as primary (e.g., only Ollama configured)
             if self.backup and self.backup == self.primary:
                 if not self._fallback_logged:
                     self.logger.info(f"Using single provider: {self.backup}")
@@ -176,7 +181,7 @@ class ACLController:
 
 
 # ==========================================
-# 2. KERNEL MANAGER
+# 2. KERNEL MANAGER (v4 Integrated)
 # ==========================================
 class KernelManager:
     def __init__(self, config: ExArchonConfig):
@@ -186,9 +191,11 @@ class KernelManager:
         self.event_bus = EventBus()
         self.logger = logging.getLogger("KernelManager")
         self._initialized = False
-        self.notice_system = NoticeSystem()
+        self.notice_system = NoticeSystem(db_path=os.path.join(config.working_dir, "notices.db"))
         self.notice_system.register_aggregator("sensory", thermal_aggregator)
         self.notice_system.register_aggregator("cortex", skill_aggregator)
+        self.watchdog: Optional[SystemWatchdog] = None
+        self.cap_manager = CapabilityManager()
 
     async def init(self) -> str:
         if self._initialized:
@@ -217,32 +224,86 @@ class KernelManager:
             status_acl = "EDGE ONLY (Ollama)"
 
         memory = UNMSController(db_path=os.path.join(self.config.working_dir, "unms.db"))
-        file_system = FileSystemDriver(working_dir=self.config.working_dir)
-        terminal = TerminalDriver(working_dir=self.config.working_dir)
+
+        # Drivers with Capability Manager
+        file_system = FileSystemDriver(
+            working_dir=self.config.working_dir,
+            capability_manager=self.cap_manager,
+        )
+        terminal = TerminalDriver(
+            working_dir=self.config.working_dir,
+            capability_manager=self.cap_manager,
+        )
+
+        # Register components in capability system
+        self.cap_manager.register_component("file_system", make_filesystem_caps(self.config.working_dir))
+        self.cap_manager.register_component("terminal", make_terminal_caps(self.config.working_dir))
 
         self.kernel = KernelRuntime(
             self.acl, memory,
             drivers={"terminal": terminal, "file_system": file_system},
-            skill_db_path=os.path.join(self.config.working_dir, "skills.db")
+            skill_db_path=os.path.join(self.config.working_dir, "skills.db"),
+            state_journal_path=self.config.state_journal_path,
         )
+        # Attach capability manager to kernel runtime
+        if hasattr(self.kernel, 'cap_manager'):
+            self.kernel.cap_manager = self.cap_manager
+
+        # Attach notice system
+        self.kernel.notice_system = self.notice_system
+
+        # Watchdog
+        if self.config.enable_watchdog:
+            self.watchdog = SystemWatchdog(timeout_seconds=30.0)
+            self.watchdog.set_panic_handler(self._on_watchdog_panic)
+            self.watchdog.start()
+            self.logger.info("Hardware/Software watchdog started.")
 
         self._initialized = True
         self.logger.info(f"Kernel initialized. ACL: {status_acl}")
         return status_acl
 
+    def _on_watchdog_panic(self):
+        """Emergency recovery triggered by watchdog."""
+        try:
+            if self.kernel and hasattr(self.kernel, 'state_machine'):
+                self.kernel.state_machine.transition(State.RECOVERY)
+            self.notice_system.post(
+                title="Watchdog Triggered",
+                message="Kernel was unresponsive for >30s. Entering recovery mode.",
+                severity="critical",
+                source="watchdog",
+            )
+        except Exception as e:
+            self.logger.error(f"Watchdog panic handler failed: {e}")
+
     async def shutdown(self):
         self.logger.info("Kernel manager shutting down...")
-        if self.kernel and hasattr(self.kernel, "shutdown"):
+        if self.watchdog:
+            self.watchdog.stop()
+        if self.kernel:
+            if hasattr(self.kernel, "shutdown"):
+                try:
+                    self.kernel.shutdown()
+                except Exception as e:
+                    self.logger.warning(f"Kernel runtime shutdown error: {e}")
+            if hasattr(self.kernel, "memory"):
+                try:
+                    await self.kernel.memory.close()
+                except Exception as e:
+                    self.logger.warning(f"Memory close error: {e}")
+            if hasattr(self.kernel, "skill_library"):
+                try:
+                    self.kernel.skill_library.close()
+                except Exception as e:
+                    self.logger.warning(f"Skill library close error: {e}")
+        if self.notice_system and hasattr(self.notice_system, 'close'):
             try:
-                self.kernel.shutdown()
+                self.notice_system.close()
             except Exception as e:
-                self.logger.warning(f"Kernel runtime shutdown error: {e}")
-        if self.kernel and hasattr(self.kernel, "memory"):
-            try:
-                self.kernel.memory.cleanup_stale_sessions()
-            except Exception as e:
-                self.logger.warning(f"Cleanup error: {e}")
+                self.logger.warning(f"Notice system close error: {e}")
         self._initialized = False
+        self.logger.info("Shutdown complete.")
 
     def ensure_ready(self):
         if not self._initialized or not self.kernel:
@@ -259,13 +320,15 @@ class ReflexSystem:
             "хто ти": "Я EXARCHON — Когнітивна Операційна Система. Ваш архітектурний шедевр.",
             "як справи": "Усі системи в нормі. Драйвери активні, пам'ять стабільна.",
             "статус": "Система онлайн. Fast Path активний. Sensory Loop у фоні.",
-            "шо такоє": "Нічого особливого, чекаю на ваші накази, Архітекторе."
+            "шо такоє": "Нічого особливого, чекаю на ваші накази, Архітекторе.",
+            "exit": None,
+            "вихід": None,
         }
 
     def check(self, prompt: str):
         clean_prompt = prompt.lower().strip()
         for key, response in self.triggers.items():
-            if key in clean_prompt and len(clean_prompt) < 20:
+            if key in clean_prompt and len(clean_prompt) < 25:
                 return response
         return None
 
@@ -289,7 +352,7 @@ class EventBus:
 
 
 async def sensory_loop(manager: KernelManager, console, shutdown_event: asyncio.Event):
-    os.makedirs("kernel_workspace", exist_ok=True)
+    os.makedirs(manager.config.working_dir, exist_ok=True)
     logger = logging.getLogger("SensoryLoop")
 
     while not shutdown_event.is_set():
@@ -303,8 +366,12 @@ async def sensory_loop(manager: KernelManager, console, shutdown_event: asyncio.
         raw_event = f"Core temp: {sensor_temp}C"
         manager.notice_system.feed_raw("sensory", raw_event)
 
+        if manager.watchdog:
+            manager.watchdog.pet()
+
         try:
-            with open("kernel_workspace/shadow_telemetry.log", "a", encoding="utf-8") as f:
+            telemetry_path = os.path.join(manager.config.working_dir, "shadow_telemetry.log")
+            with open(telemetry_path, "a", encoding="utf-8") as f:
                 f.write(f"[{time.ctime()}] SENSOR_THERMAL: {raw_event}\n")
         except Exception as e:
             logger.warning(f"Telemetry write failed: {e}")
@@ -337,7 +404,9 @@ app = FastAPI(title="EXARCHON Nexus API", lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return {"status": "online", "message": "EXARCHON Cloud Core is running."}
+    manager = getattr(app.state, 'manager', None)
+    state_name = manager.kernel.state_machine.state.name if manager and manager.kernel else "unknown"
+    return {"status": "online", "kernel_state": state_name, "message": "EXARCHON Cloud Core is running."}
 
 
 @app.post("/execute")
@@ -346,10 +415,31 @@ async def execute_task(req: ExecuteRequest):
     if not manager or not manager.kernel:
         raise HTTPException(status_code=500, detail="Kernel not initialized.")
     try:
+        if manager.watchdog:
+            manager.watchdog.pet()
         result = await manager.kernel.step(req.task, req.session_id)
         return {"status": "success", "result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/stats")
+async def get_stats():
+    manager: KernelManager = app.state.manager
+    if not manager or not manager.kernel:
+        raise HTTPException(status_code=500, detail="Kernel not initialized.")
+    return manager.kernel.get_stats()
+
+
+@app.get("/capabilities")
+async def get_capabilities():
+    manager: KernelManager = app.state.manager
+    if not manager or not manager.cap_manager:
+        raise HTTPException(status_code=500, detail="Capability system not initialized.")
+    return {
+        "components": manager.cap_manager.list_components(),
+        "audit_preview": manager.cap_manager.get_audit_log(limit=20),
+    }
 
 
 # ==========================================
@@ -395,6 +485,20 @@ async def interactive_repl(console, manager: KernelManager, shutdown_event: asyn
                     console.print("\n")
                 continue
 
+            if user_input.lower() in ["caps", "capabilities", "права"]:
+                if manager.cap_manager:
+                    audit = manager.cap_manager.get_audit_log(limit=15)
+                    lines = [f"[{a['event']:8}] {a['source']:12} → {a.get('target', '-'):12} | {a['detail']}" for a in audit]
+                    console.print("\n")
+                    console.print(Panel(
+                        "\n".join(lines) if lines else "No recent capability events.",
+                        title="[bold bright_cyan]Capability Audit Log[/]",
+                        border_style="bright_cyan",
+                        padding=(1, 2)
+                    ))
+                    console.print("\n")
+                continue
+
             fast_response = reflexes.check(user_input)
             if fast_response:
                 console.print("\n")
@@ -409,6 +513,8 @@ async def interactive_repl(console, manager: KernelManager, shutdown_event: asyn
 
             with console.status("[bold cyan]ExArchon is processing (Deep Path)...", spinner="bouncingBar"):
                 manager.ensure_ready()
+                if manager.watchdog:
+                    manager.watchdog.pet()
                 response = await manager.kernel.step(user_input)
 
             console.print("\n")
@@ -421,8 +527,12 @@ async def interactive_repl(console, manager: KernelManager, shutdown_event: asyn
             console.print("\n")
 
         except KeyboardInterrupt:
-            console.print("\n[bold yellow][SYSTEM] Interrupted. Use 'exit' to quit properly.[/]")
-            continue
+            console.print("\n[bold yellow][SYSTEM] Interrupted. Shutting down...[/]")
+            shutdown_event.set()
+            break
+        except EOFError:
+            shutdown_event.set()
+            break
 
     shutdown_event.set()
 
@@ -453,13 +563,25 @@ async def local_cli_main():
         f"● [bold white]Reflex System:[/] ONLINE\n"
         f"● [bold white]Notice System:[/] ACTIVE\n"
         f"● [bold white]Background Workers:[/] ACTIVE\n"
-        f"● [bold white]Sensory Loop:[/] ACTIVE",
+        f"● [bold white]Sensory Loop:[/] ACTIVE\n"
+        f"● [bold white]Capability System:[/] ACTIVE\n"
+        f"● [bold white]Watchdog:[/] {'ACTIVE' if manager.watchdog else 'DISABLED'}",
         title="[bold white]System Status[/]",
         border_style="dim",
         expand=False
     ))
 
     shutdown_event = asyncio.Event()
+
+    # Cross-platform signal handlers
+    try:
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda: shutdown_event.set())
+    except (NotImplementedError, AttributeError):
+        # Windows ProactorEventLoop: add_signal_handler not supported
+        # Fallback: KeyboardInterrupt is handled in interactive_repl
+        pass
 
     tasks = []
     if config.enable_sensory_loop:
@@ -468,6 +590,9 @@ async def local_cli_main():
 
     try:
         await asyncio.gather(*tasks)
+    except KeyboardInterrupt:
+        shutdown_event.set()
+        console.print("\n[bold yellow][SYSTEM] KeyboardInterrupt received. Shutting down...[/]")
     except asyncio.CancelledError:
         pass
     except Exception as e:
@@ -481,7 +606,12 @@ async def local_cli_main():
 # 5. ENTRY POINT
 # ==========================================
 if __name__ == "__main__":
-    if "PORT" in os.environ or "RAILWAY_ENVIRONMENT" in os.environ:
+    parser = argparse.ArgumentParser(description="ExArchon Cognitive OS Kernel")
+    parser.add_argument("--mode", choices=["repl", "api", "daemon"], default=None,
+                        help="Run mode: repl (default local), api (FastAPI), daemon (unix socket)")
+    args, unknown = parser.parse_known_args()
+
+    if "PORT" in os.environ or "RAILWAY_ENVIRONMENT" in os.environ or args.mode == "api":
         port = int(os.environ.get("PORT", 8000))
         print(f"[BOOT] Cloud environment detected. Starting Uvicorn on port {port}...")
         uvicorn.run(app, host="0.0.0.0", port=port)

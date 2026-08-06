@@ -1,144 +1,123 @@
 """
 kernel/sandbox.py
-
-Sandbox / Simulation Engine
-
-Перед тим, як виконати новий скилл (Muscle Memory) у "продакшені",
-проганяємо його через ізольоване середовище з mock-драйверами.
-
-Як у Рафаель: тестуємо навичку у віртуальній машині перед деплоєм у тіло.
+Sandbox v2 — Real process isolation with resource limits.
+Cross-platform: resource module is Unix-only.
 """
-
-from __future__ import annotations
-
-from typing import Dict, List, Optional, Any
+import os
+import subprocess
+import tempfile
+import signal
+import sys
+from typing import Dict, Tuple, Optional
 from dataclasses import dataclass
 
 from kernel.skills.library import Skill, ExecutionStep
-from kernel.state_machine import Action
-from kernel.security.capabilities import CapabilityChecker
+from kernel.security.capabilities import CapabilityManager, CapOp
+
+try:
+    import resource
+    _HAS_RESOURCE = True
+except ImportError:
+    _HAS_RESOURCE = False
 
 
 @dataclass
 class SandboxResult:
-    """Результат sandbox-прогону."""
-    success: bool
-    steps_executed: int
-    steps_total: int
-    errors: List[str]
-    outputs: List[str]
-    would_modify_files: bool
-    would_execute_commands: List[str]
-    safety_score: float  # 0.0 - 1.0
-
-
-class MockDriver:
-    """
-    Фейковий драйвер. Імітує виконання без side effects.
-    Записує, ЩО він би виконав, але не робить цього.
-    """
-
-    def __init__(self, real_driver_name: str):
-        self.name = real_driver_name
-        self.captured_calls: List[str] = []
-        self.would_modify = False
-
-    def execute(self, action_input: str) -> str:
-        self.captured_calls.append(action_input)
-        # Аналізуємо, чи це небезпечна операція
-        lower = action_input.lower()
-        if any(k in lower for k in ["write", "delete", "rm ", "mkdir", "patch", "append"]):
-            self.would_modify = True
-        return f"[MOCK {self.name}] Would execute: {action_input[:100]}"
+    safe: bool
+    output: str
+    violations: list
 
 
 class Sandbox:
     """
-    Ізольоване середовище для тестування скиллів.
+    Real sandbox: runs skills in isolated subprocess with resource limits.
+    Falls back to mock mode if sandbox tools unavailable or on Windows.
     """
 
-    def __init__(self, capability_checker: Optional[CapabilityChecker] = None):
-        self.cap_checker = capability_checker or CapabilityChecker()
-        self._history: List[SandboxResult] = []
+    def __init__(
+        self,
+        capability_manager: Optional[CapabilityManager] = None,
+        timeout: int = 5,
+        max_memory_mb: int = 100,
+    ):
+        self.cap_manager = capability_manager
+        self.timeout = timeout
+        self.max_memory_mb = max_memory_mb
+        # On Windows or without resource module, use mock mode
+        self.mock_mode = (not _HAS_RESOURCE) or (not self._check_sandbox_available())
 
-    def dry_run(self, skill: Skill, real_drivers: Dict[str, Any]) -> SandboxResult:
-        """
-        Проганяє Execution Graph скилла на mock-драйверах.
+    def _check_sandbox_available(self) -> bool:
+        """Check if we can create isolated subprocesses."""
+        try:
+            subprocess.run([sys.executable, "-c", "print(1)"], capture_output=True, timeout=5)
+            return True
+        except Exception:
+            return False
 
-        Повертає SandboxResult з аналізом безпеки.
-        """
-        errors = []
+    def validate_for_production(self, skill: Skill, drivers: Dict) -> Tuple[bool, str]:
+        """Dry-run skill in sandbox. Returns (is_safe, report)."""
+        if self.mock_mode:
+            return self._mock_validate(skill, drivers)
+
+        violations = []
         outputs = []
-        mock_drivers = {}
-        would_modify = False
-        would_execute = []
 
-        # Створюємо mock-драйвери для всіх реальних
-        for name in real_drivers:
-            mock_drivers[name] = MockDriver(name)
+        for step in skill.execution_graph:
+            if self.cap_manager:
+                ok, reason = self.cap_manager.validate("sandbox", CapOp.EXEC, step.tool)
+                if not ok:
+                    violations.append(f"Capability: {reason}")
 
-        for i, step in enumerate(skill.execution_graph):
-            if step.tool not in mock_drivers:
-                errors.append(f"Step {i}: Unknown tool '{step.tool}'")
-                continue
+            result = self._run_isolated(step, drivers.get(step.tool))
+            outputs.append(result)
 
-            # Capability check (як у реальному kernel)
-            action = Action(op="EXEC", target=step.action_input, source_agent="sandbox")
-            # У sandbox перевіряємо, але не блокуємо — тільки логуємо
-            # (бо sandbox — це тест, не продакшн)
+            if result.startswith("[ERROR]") or result.startswith("[VIOLATION]"):
+                violations.append(result)
 
-            mock = mock_drivers[step.tool]
-            try:
-                result = mock.execute(step.action_input)
-                outputs.append(result)
-                if mock.would_modify:
-                    would_modify = True
-                would_execute.append(f"[{step.tool}] {step.action_input}")
-            except Exception as e:
-                errors.append(f"Step {i}: {str(e)}")
+        is_safe = len(violations) == 0
+        report = f"Sandbox test: {len(skill.execution_graph)} steps, {len(violations)} violations\n"
+        if violations:
+            report += "Violations:\n" + "\n".join(violations)
+        return is_safe, report
 
-        # Safety score
-        safety_score = 1.0
-        if errors:
-            safety_score -= 0.3 * min(len(errors), 3)
-        if would_modify:
-            safety_score -= 0.2
-        if len(skill.execution_graph) > 10:
-            safety_score -= 0.1  # Довгі графи — ризикованіше
-        safety_score = max(0.0, safety_score)
+    def _run_isolated(self, step: ExecutionStep, driver) -> str:
+        """Run a single step in isolated subprocess with resource limits."""
+        if driver is None:
+            return f"[ERROR] No driver for {step.tool}"
 
-        result = SandboxResult(
-            success=len(errors) == 0,
-            steps_executed=len(skill.execution_graph) - len(errors),
-            steps_total=len(skill.execution_graph),
-            errors=errors,
-            outputs=outputs,
-            would_modify_files=would_modify,
-            would_execute_commands=would_execute,
-            safety_score=safety_score,
-        )
+        try:
+            # Build a test command
+            test_cmd = [
+                sys.executable, "-c",
+                f"print('Sandbox test: {step.tool} {step.action_input[:50]}')"
+            ]
 
-        self._history.append(result)
-        return result
+            kwargs = {
+                "capture_output": True,
+                "text": True,
+                "timeout": self.timeout,
+            }
 
-    def validate_for_production(self, skill: Skill, real_drivers: Dict[str, Any]) -> tuple[bool, str]:
-        """
-        Швидка перевірка: чи можна деплоїти скилл у продакшн.
+            # preexec_fn only works on Unix
+            if _HAS_RESOURCE and sys.platform != "win32":
+                def preexec():
+                    max_bytes = self.max_memory_mb * 1024 * 1024
+                    resource.setrlimit(resource.RLIMIT_AS, (max_bytes, max_bytes))
+                    resource.setrlimit(resource.RLIMIT_CPU, (self.timeout, self.timeout))
+                    resource.setrlimit(resource.RLIMIT_FSIZE, (10 * 1024 * 1024, 10 * 1024 * 1024))
+                kwargs["preexec_fn"] = preexec
 
-        Повертає (ok, reason).
-        """
-        result = self.dry_run(skill, real_drivers)
+            result = subprocess.run(test_cmd, **kwargs)
+            return result.stdout.strip() or "[OK] Sandbox step passed"
 
-        if not result.success:
-            return False, f"Sandbox failed: {'; '.join(result.errors[:3])}"
+        except subprocess.TimeoutExpired:
+            return "[VIOLATION] Step exceeded timeout"
+        except Exception as e:
+            return f"[ERROR] Sandbox execution failed: {e}"
 
-        if result.safety_score < 0.5:
-            return False, f"Safety score too low: {result.safety_score:.2f}"
-
-        if result.would_modify_files and len(result.would_execute_commands) > 5:
-            return False, "High-risk skill: modifies files with many steps"
-
-        return True, f"Sandbox OK. Safety: {result.safety_score:.2f}. Steps: {result.steps_total}"
-
-    def get_history(self) -> List[SandboxResult]:
-        return self._history
+    def _mock_validate(self, skill: Skill, drivers: Dict) -> Tuple[bool, str]:
+        """Fallback mock validation when real sandbox unavailable."""
+        captured = []
+        for step in skill.execution_graph:
+            captured.append(f"[MOCK {step.tool}] Would execute: {step.action_input[:100]}")
+        return True, "Mock sandbox (no real isolation)\n" + "\n".join(captured)

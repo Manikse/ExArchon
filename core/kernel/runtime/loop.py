@@ -1,22 +1,21 @@
 """
 ExArchon KernelRuntime v4.0 — Capability-Based State-Driven Kernel.
 
-Зміни від v3:
-1. Інтеграція з новим CapabilityManager (замість CapabilityChecker).
-2. Execution Limits: timeout, memory tracking, syscall limits для skill execution.
-3. Інтеграція з WAL StateMachine — shutdown викликає state_machine.shutdown().
-4. Graceful Degradation: якщо LLM недоступний — queue task + notify.
-5. Resource tracking для кожного execution context.
-
-Аналогія з Raphael: це саме ядро — воно вирішує, хто що може,
-записує кожне рішення, і ніколи не втрачає стан.
+Cross-platform: resource module is Unix-only. Windows fallback included.
 """
 import time
 import asyncio
-import resource
 import os
+import sys
 from typing import Dict, Optional, Any
 from dataclasses import dataclass, field
+
+# Cross-platform resource limits
+try:
+    import resource
+    _HAS_RESOURCE = True
+except ImportError:
+    _HAS_RESOURCE = False
 
 from kernel.cortex.react_engine import ReactEngine, ReActTrace
 from kernel.skills.library import SkillLibrary, Skill, ExecutionStep
@@ -54,8 +53,18 @@ class ExecutionContext:
 
     def check_memory(self) -> bool:
         """Перевіряє, чи не перевищено ліміт пам'яті процесу."""
+        if not _HAS_RESOURCE:
+            # Windows: cannot check via resource module, assume OK
+            # Future: use psutil for cross-platform memory tracking
+            return True
         try:
-            usage_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            # ru_maxrss is in KB on Linux, bytes on macOS — normalize to MB
+            usage_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # On Linux it's KB, on macOS it's bytes
+            if sys.platform == "darwin":
+                usage_mb = usage_kb / (1024 * 1024)
+            else:
+                usage_mb = usage_kb / 1024
             return usage_mb < self.max_memory_mb
         except Exception:
             return True
@@ -116,19 +125,13 @@ class KernelRuntime:
 
     def _init_capabilities(self):
         """Реєструє всі компоненти та видає їм початкові capabilities."""
-        # Terminal
         if "terminal" in self.drivers:
             self.cap_manager.register_component("terminal", make_terminal_caps())
-        # FileSystem
         if "file_system" in self.drivers:
             self.cap_manager.register_component("file_system", make_filesystem_caps())
-        # Cortex
         self.cap_manager.register_component("cortex", make_cortex_caps())
-        # Muscle Memory
         self.cap_manager.register_component("muscle_memory", make_muscle_caps())
-        # Reflex
         self.cap_manager.register_component("reflex", make_reflex_caps())
-        # Sandbox
         self.cap_manager.register_component("sandbox", make_sandbox_caps())
 
         print(f"[KernelRuntime] Capability system initialized. Components: {self.cap_manager.list_components()}")
@@ -155,15 +158,12 @@ class KernelRuntime:
         """State-driven entry point з execution tracking."""
         start_time = time.time()
 
-        # === Execution Context ===
         ctx = ExecutionContext(
             session_id=session_id,
             user_input=user_input,
             max_time_ms=self.execution_limits.cortex_timeout_ms,
         )
         self._active_contexts[session_id] = ctx
-
-        # Лічильник skills per session
         self._session_skill_count[session_id] = self._session_skill_count.get(session_id, 0)
 
         try:
@@ -180,7 +180,6 @@ class KernelRuntime:
 
             skill = self.skill_library.find_skill(user_input, min_score=0.55)
             if skill:
-                # Перевірка ліміту skills per session
                 if self._session_skill_count[session_id] >= self.execution_limits.max_skills_per_session:
                     self.state_machine.transition(State.IDLE)
                     return f"[Kernel] Session skill limit ({self.execution_limits.max_skills_per_session}) reached."
@@ -201,7 +200,6 @@ class KernelRuntime:
             except TransitionError:
                 pass
 
-            # Graceful degradation: перевіряємо доступність LLM
             if not await self._check_acl_available():
                 self.state_machine.transition(State.RECOVERY)
                 notice = (
@@ -233,14 +231,13 @@ class KernelRuntime:
                 fallback_msg="[Kernel] Cortex timeout. Task abandoned.",
             )
 
-            if trace.success and len(trace.steps) >= 1:
+            if trace and trace.success and len(trace.steps) >= 1:
                 self._schedule_skill_compilation(trace, user_input)
 
             self.state_machine.transition(State.IDLE)
-            return trace.final_answer
+            return trace.final_answer if trace else "[Kernel] No response from cognitive layer."
 
         except Exception as e:
-            # Global error handler — never crash the kernel
             self.state_machine.transition(State.RECOVERY)
             error_msg = f"[Kernel ERROR] {type(e).__name__}: {str(e)}"
             print(f"[KernelRuntime] CRITICAL: {error_msg}")
@@ -251,31 +248,21 @@ class KernelRuntime:
             return error_msg
 
         finally:
-            # Cleanup context
             if session_id in self._active_contexts:
                 del self._active_contexts[session_id]
 
     def _reflex_check(self, user_input: str) -> Optional[str]:
-        """
-        System 0: Hardcoded reflexes.
-        Instant (<1ms), zero-cost safety checks.
-        """
+        """System 0: Hardcoded reflexes. Instant (<1ms), zero-cost."""
         lower = user_input.lower().strip()
-
-        # Emergency shutdown
         if lower in ("shutdown now", "kernel panic", "emergency stop"):
-            # Перевірка capability
             ok, _ = self.cap_manager.validate("reflex", CapOp.EXEC, "shutdown")
             if ok:
                 self.state_machine.transition(State.SHUTDOWN)
                 return "[REFLEX] Emergency shutdown initiated."
             return "[REFLEX DENIED] Shutdown capability not granted."
-
-        # Self-status
         if lower in ("status", "kernel status", "what is your state"):
             stats = self.get_stats()
             return f"[REFLEX] State: {stats['current_state']}, Gen: {stats['state_generation']}, Skills: {stats['total_skills']}"
-
         return None
 
     async def _execute_skill(self, skill: Skill, session_id: str, ctx: ExecutionContext) -> str:
@@ -284,12 +271,9 @@ class KernelRuntime:
         skill_start = time.time()
 
         for step in skill.execution_graph:
-            # Перевірка таймауту контексту
             if ctx.is_timed_out():
                 outputs.append(f"[Error] Execution context timed out after {ctx.max_time_ms}ms")
                 break
-
-            # Перевірка пам'яті
             if not ctx.check_memory():
                 outputs.append(f"[Error] Memory limit exceeded ({ctx.max_memory_mb}MB)")
                 break
@@ -299,19 +283,15 @@ class KernelRuntime:
                 continue
 
             driver = self.drivers[step.tool]
-
-            # Capability check
             action = Action(op="EXEC", target=step.action_input, source_agent="muscle_memory")
             if not self._check_capability(step.tool, action):
                 outputs.append(f"[Error] Capability denied for {step.tool}")
                 break
 
-            # Підстановка {{prev}}
             action_input = step.action_input
             if outputs and "{{prev}}" in action_input:
                 action_input = action_input.replace("{{prev}}", outputs[-1][:500])
 
-            # Skill timeout
             skill_timeout = self.execution_limits.skill_timeout_ms / 1000
 
             try:
@@ -321,7 +301,6 @@ class KernelRuntime:
                         timeout=skill_timeout,
                     )
                 else:
-                    # Синхронний driver — запускаємо в thread з таймаутом
                     result = await asyncio.wait_for(
                         asyncio.to_thread(driver.execute, action_input),
                         timeout=skill_timeout,
@@ -341,7 +320,6 @@ class KernelRuntime:
         return "\n".join(outputs) if outputs else "[Skill executed with no output]"
 
     async def _run_with_timeout(self, coro, timeout_ms: int, fallback_msg: str):
-        """Wrapper для запуску coroutine з таймаутом."""
         try:
             return await asyncio.wait_for(coro, timeout=timeout_ms / 1000)
         except asyncio.TimeoutError:
@@ -349,18 +327,14 @@ class KernelRuntime:
             return None
 
     async def _check_acl_available(self) -> bool:
-        """Перевіряє, чи доступний LLM provider."""
         try:
-            # Швидкий health check
             if hasattr(self.acl, 'is_available'):
                 return await asyncio.wait_for(self.acl.is_available(), timeout=2.0)
-            # Fallback: спробуємо simple ping
             return True
         except Exception:
             return False
 
     def _schedule_skill_compilation(self, trace: ReActTrace, user_input: str):
-        """Raphael-style: Skill synthesis goes to background worker."""
         trace_steps = [
             {"tool": s.action, "action_input": s.action_input}
             for s in trace.steps if s.action != "respond"
@@ -376,11 +350,9 @@ class KernelRuntime:
             )
 
     def sandbox_validate_skill(self, skill: Skill) -> tuple[bool, str]:
-        """Raphael-style: Test skill in sandbox before trusting it."""
         return self.sandbox.validate_for_production(skill, self.drivers)
 
     def get_background_status(self) -> str:
-        """Статус фонових задач."""
         pending = self.background.get_pending_count()
         recent = self.background.get_results(limit=3)
         lines = [f"Background queue: {pending} pending"]
@@ -390,7 +362,6 @@ class KernelRuntime:
         return "\n".join(lines)
 
     def get_capability_audit(self) -> str:
-        """Human-readable audit log capabilities."""
         entries = self.cap_manager.get_audit_log(limit=20)
         lines = ["=== Capability Audit (last 20) ==="]
         for e in entries:
@@ -399,15 +370,13 @@ class KernelRuntime:
         return "\n".join(lines)
 
     def shutdown(self):
-        """Graceful shutdown — checkpoint state, close connections."""
         print("[KernelRuntime] Initiating graceful shutdown...")
         self.background.stop()
-        self.state_machine.shutdown()  # WAL checkpoint + close
+        self.state_machine.shutdown()
         if self.memory and hasattr(self.memory, 'close'):
             try:
                 import asyncio
                 if asyncio.iscoroutinefunction(self.memory.close):
-                    # Запускаємо, якщо є event loop
                     try:
                         loop = asyncio.get_running_loop()
                         loop.create_task(self.memory.close())

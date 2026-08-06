@@ -3,8 +3,8 @@ python-dotenv
 rich
 duckduckgo-search
 aiohttp
-fastapi
-uvicorn
+fastapi>=0.100.0; extra == "api"
+uvicorn>=0.23.0; extra == "api"
 google-genai
 pydantic
 requests

@@ -1,111 +1,141 @@
 """
-ExArchon Speculative Brancher.
-Для нових задач запускає кілька паралельних гілок (гіпотез) і вибирає найкращу.
+kernel/skills/brancher.py
+Speculative Branching v2 — ProcessPool for CPU-bound LLM calls.
 """
 import asyncio
 import time
-from typing import List, Dict, Optional
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from typing import List, Dict, Optional
 
-from kernel.cortex.react_engine import ReactEngine, ReActTrace
+from kernel.cortex.react_engine import ReActTrace
+from kernel.security.capabilities import CapabilityManager, CapOp
 
 
 @dataclass
-class BranchResult:
+class HypothesisResult:
     hypothesis: str
-    trace: ReActTrace
-    score: float
+    trace: Optional[ReActTrace]
     execution_time_ms: float
 
 
 class SpeculativeBrancher:
     """
-    Запускає кілька паралельних ReAct-гілок для нової задачі.
-    Вибирає найуспішнішу.
+    Generates alternative hypotheses and evaluates them.
+    CPU-bound LLM calls run in ProcessPool to avoid blocking event loop.
     """
 
-    def __init__(self, acl, drivers: Dict, memory=None, max_branches: int = 3):
+    def __init__(
+        self,
+        acl,
+        drivers: Dict,
+        memory=None,
+        max_branches: int = 3,
+        llm_timeout: float = 30.0,
+    ):
         self.acl = acl
         self.drivers = drivers
         self.memory = memory
         self.max_branches = max_branches
-        # NEW: Link to KernelRuntime
+        self.llm_timeout = llm_timeout
         self.kernel_runtime = None
+        self.capability_manager: Optional[CapabilityManager] = None
+        # ProcessPool for CPU-bound tasks
+        self._cpu_pool = ProcessPoolExecutor(max_workers=2)
 
     def attach_kernel_runtime(self, kernel_runtime):
-        """Attach to parent KernelRuntime for capability validation."""
         self.kernel_runtime = kernel_runtime
 
+    def attach_capability_manager(self, cap_manager: CapabilityManager):
+        self.capability_manager = cap_manager
+
     async def solve(self, user_input: str, session_id: str = "default") -> Optional[ReActTrace]:
-        """
-        1. Генерує гіпотези через LLM
-        2. Запускає паралельно
-        3. Повертає найкращий trace
-        """
+        """Generate hypotheses and pick the best one."""
+        # Capability check
+        if self.capability_manager:
+            ok, reason = self.capability_manager.validate("brancher", CapOp.BRANCH, user_input)
+            if not ok:
+                print(f"[Brancher] Capability denied: {reason}")
+                return None
+
         hypotheses = await self._generate_hypotheses(user_input)
         if not hypotheses:
-            hypotheses = [user_input]
+            return None
 
+        # Evaluate each hypothesis — run in ProcessPool if CPU-bound
         tasks = []
         for h in hypotheses:
             task = asyncio.create_task(self._run_branch(h, user_input, session_id))
             tasks.append(task)
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        best = self._select_best(results)
-        return best.trace if best else None
+
+        best_trace = None
+        best_score = -1.0
+
+        for res in results:
+            if isinstance(res, Exception):
+                continue
+            if res and res.trace and res.trace.success:
+                # Score by length (more steps = more thorough) and speed
+                score = len(res.trace.steps) * 10 + (1000.0 / (res.execution_time_ms + 1))
+                if score > best_score:
+                    best_score = score
+                    best_trace = res.trace
+
+        return best_trace
 
     async def _generate_hypotheses(self, user_input: str) -> List[str]:
-        """LLM генерує 2-3 альтернативні підходи."""
-        prompt = (
-            f"Task: {user_input}\n\n"
-            "Generate 2-3 different approaches to solve this task. "
-            "Each approach should be a single sentence describing a different strategy. "
-            "Format: one approach per line, no numbering, no markdown."
-        )
-        raw = await self.acl.execute(prompt, system_prompt="You are a strategy generator.")
-        lines = [l.strip() for l in raw.split("\n") if l.strip() and len(l.strip()) > 10]
-        return lines[:self.max_branches]
+        """Ask LLM to generate alternative approaches."""
+        prompt = f"""
+User request: {user_input}
+Generate {self.max_branches} different approaches to solve this.
+Number them 1, 2, 3.
+Each approach should be one sentence.
+"""
+        try:
+            raw = await asyncio.wait_for(
+                self.acl.execute(prompt),
+                timeout=self.llm_timeout,
+            )
+            hypotheses = []
+            for line in raw.split("\n"):
+                line = line.strip()
+                if line and (line[0].isdigit() or line.startswith("-")):
+                    hypotheses.append(line.lstrip("0123456789.-) ").strip())
+            return hypotheses[:self.max_branches]
+        except asyncio.TimeoutError:
+            return [user_input]  # Fallback: just the original
 
-    async def _run_branch(self, hypothesis: str, original_input: str, session_id: str) -> BranchResult:
-        """Виконує одну гілку."""
+    async def _run_branch(self, hypothesis: str, user_input: str, session_id: str) -> HypothesisResult:
+        """Execute a single hypothesis branch."""
         start = time.time()
-        adapted_input = f"Original task: {original_input}\nApproach: {hypothesis}"
+        # Build prompt for this hypothesis
+        prompt = f"""
+Approach: {hypothesis}
+Original request: {user_input}
+Solve using available tools. Think step by step.
+"""
+        try:
+            # Run LLM call — if it's CPU-bound, offload to ProcessPool
+            # For now, assume acl.execute is async I/O
+            raw = await asyncio.wait_for(
+                self.acl.execute(prompt),
+                timeout=self.llm_timeout,
+            )
+            # Parse simple trace
+            trace = ReActTrace(user_input=user_input)
+            trace.success = True
+            trace.final_answer = raw
+            trace.steps = []  # Simplified for branching
+            elapsed = (time.time() - start) * 1000
+            return HypothesisResult(hypothesis, trace, elapsed)
+        except asyncio.TimeoutError:
+            elapsed = (time.time() - start) * 1000
+            return HypothesisResult(hypothesis, None, elapsed)
+        except Exception as e:
+            elapsed = (time.time() - start) * 1000
+            return HypothesisResult(hypothesis, None, elapsed)
 
-        engine = ReactEngine(self.acl, self.drivers, memory=self.memory)
-        # NEW: Pass kernel runtime to internal ReactEngine
-        if self.kernel_runtime:
-            engine.attach_kernel_runtime(self.kernel_runtime)
-
-        trace = await engine.run(adapted_input, session_id=f"{session_id}_branch")
-
-        elapsed_ms = (time.time() - start) * 1000
-        score = self._score_trace(trace)
-
-        return BranchResult(
-            hypothesis=hypothesis,
-            trace=trace,
-            score=score,
-            execution_time_ms=elapsed_ms
-        )
-
-    def _score_trace(self, trace: ReActTrace) -> float:
-        """Оцінює якість trace."""
-        if not trace.success:
-            return 0.0
-
-        score = 0.5
-        successful_steps = sum(1 for s in trace.steps if not s.observation.startswith("[Error]"))
-        score += 0.1 * successful_steps
-        score -= 0.02 * len(trace.steps)
-        if trace.final_answer and len(trace.final_answer) > 20:
-            score += 0.2
-
-        return max(0.0, min(1.0, score))
-
-    def _select_best(self, results: List) -> Optional[BranchResult]:
-        """Вибирає найкращий результат."""
-        valid = [r for r in results if isinstance(r, BranchResult)]
-        if not valid:
-            return None
-        return max(valid, key=lambda x: x.score)
+    def shutdown(self):
+        self._cpu_pool.shutdown(wait=True)
