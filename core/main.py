@@ -25,6 +25,7 @@ from drivers.terminal import TerminalDriver
 from drivers.file_system import FileSystemDriver
 from kernel.unms.memory import UNMSController
 from kernel.runtime.loop import KernelRuntime
+from kernel.runtime.loop_v2 import KernelRuntimeV2
 from kernel.state_machine import StateMachine, State
 from kernel.notice_system import NoticeSystem, NoticeBoard, NoticeSeverity, thermal_aggregator, skill_aggregator
 from kernel.watchdog import SystemWatchdog
@@ -181,13 +182,13 @@ class ACLController:
 
 
 # ==========================================
-# 2. KERNEL MANAGER (v4 Integrated)
+# 2. KERNEL MANAGER (v4 Integrated + v2)
 # ==========================================
 class KernelManager:
     def __init__(self, config: ExArchonConfig):
         self.config = config
         self.acl: Optional[ACLController] = None
-        self.kernel: Optional[KernelRuntime] = None
+        self.kernel: Optional[KernelRuntimeV2] = None
         self.event_bus = EventBus()
         self.logger = logging.getLogger("KernelManager")
         self._initialized = False
@@ -239,18 +240,19 @@ class KernelManager:
         self.cap_manager.register_component("file_system", make_filesystem_caps(self.config.working_dir))
         self.cap_manager.register_component("terminal", make_terminal_caps(self.config.working_dir))
 
-        self.kernel = KernelRuntime(
+        # v2 Runtime with Muscle Engine + Context Engine + Parallel Cortex
+        self.kernel = KernelRuntimeV2(
             self.acl, memory,
             drivers={"terminal": terminal, "file_system": file_system},
-            skill_db_path=os.path.join(self.config.working_dir, "skills.db"),
+            workspace=self.config.working_dir,
             state_journal_path=self.config.state_journal_path,
+            enable_batching=True,
+            enable_aml=True,
         )
-        # Attach capability manager to kernel runtime
-        if hasattr(self.kernel, 'cap_manager'):
-            self.kernel.cap_manager = self.cap_manager
 
-        # Attach notice system
-        self.kernel.notice_system = self.notice_system
+        # Wire v2 systems
+        self.kernel.attach_capability_manager(self.cap_manager)
+        self.kernel.attach_notice_system(self.notice_system)
 
         # Watchdog
         if self.config.enable_watchdog:
@@ -287,9 +289,9 @@ class KernelManager:
                     self.kernel.shutdown()
                 except Exception as e:
                     self.logger.warning(f"Kernel runtime shutdown error: {e}")
-            if hasattr(self.kernel, "memory"):
+            if hasattr(self.kernel, "memory_legacy"):
                 try:
-                    await self.kernel.memory.close()
+                    await self.kernel.memory_legacy.close()
                 except Exception as e:
                     self.logger.warning(f"Memory close error: {e}")
             if hasattr(self.kernel, "skill_library"):
@@ -357,14 +359,17 @@ async def sensory_loop(manager: KernelManager, console, shutdown_event: asyncio.
 
     while not shutdown_event.is_set():
         try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=10)
+            await asyncio.wait_for(shutdown_event.wait(), timeout=30)
             break
         except asyncio.TimeoutError:
             pass
 
         sensor_temp = 20 + random.randint(-5, 15)
         raw_event = f"Core temp: {sensor_temp}C"
-        manager.notice_system.feed_raw("sensory", raw_event)
+
+        # Only post thermal notice on anomalies, not normal temps
+        if sensor_temp > 60 or sensor_temp < 10:
+            manager.notice_system.feed_raw("sensory", raw_event)
 
         if manager.watchdog:
             manager.watchdog.pet()
@@ -405,7 +410,9 @@ app = FastAPI(title="EXARCHON Nexus API", lifespan=lifespan)
 @app.get("/")
 async def root():
     manager = getattr(app.state, 'manager', None)
-    state_name = manager.kernel.state_machine.state.name if manager and manager.kernel else "unknown"
+    state_name = "unknown"
+    if manager and manager.kernel and hasattr(manager.kernel, 'state_machine'):
+        state_name = manager.kernel.state_machine.state.name
     return {"status": "online", "kernel_state": state_name, "message": "EXARCHON Cloud Core is running."}
 
 
@@ -579,8 +586,6 @@ async def local_cli_main():
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, lambda: shutdown_event.set())
     except (NotImplementedError, AttributeError):
-        # Windows ProactorEventLoop: add_signal_handler not supported
-        # Fallback: KeyboardInterrupt is handled in interactive_repl
         pass
 
     tasks = []

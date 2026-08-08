@@ -221,3 +221,21 @@ Created by **Manikse** — Building the distributed infrastructure of the future
     <img src="https://img.shields.io/badge/-Sponsor%20EXARCHON-ea4aaa?style=for-the-badge&logo=github&logoColor=white" width="220" alt="Sponsor EXARCHON"/>
   </a>
 </div>
+
+
+
+ExArchon - Autonomous engineering system kernel
+Copyright (C) 2026 Manikse (Pavlo Blaida)
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.

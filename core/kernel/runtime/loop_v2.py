@@ -17,8 +17,8 @@ from kernel.memory.atom import ContextChainBuilder, FactExtractor
 from kernel.cortex.batcher import BatchingEngine, TaskPriority
 from kernel.cortex.aml_loader import AdaptiveModelLoader, ModelTier
 
-# Legacy imports (for compat)
-from kernel.notice_system import NoticeSystem
+# Legacy compat
+from kernel.state_machine import StateMachine, State
 
 
 @dataclass
@@ -52,6 +52,12 @@ class KernelRuntimeV2:
         self.workspace = workspace
         os.makedirs(workspace, exist_ok=True)
 
+        # State machine (legacy compat)
+        self.state_machine = StateMachine()
+
+        # Legacy skill_library stub (for shutdown compat)
+        self.skill_library = _SkillLibraryStub()
+
         # v1.0 Muscle Engine
         self.hnma = HNMAController(base_path=workspace)
         self.vm = SkillVM(drivers=drivers)
@@ -78,7 +84,7 @@ class KernelRuntimeV2:
 
         # Capability manager (wired externally)
         self.cap_manager = None
-        self.notice_system: Optional[NoticeSystem] = None
+        self.notice_system = None
 
         # Stats
         self._muscle_hits = 0
@@ -116,9 +122,13 @@ class KernelRuntimeV2:
         start = time.perf_counter()
         self._total_tasks += 1
 
+        # Update state machine
+        # state: active work
+
         # 1. Reflex fast path
         reflex = self._check_reflex(user_input)
         if reflex:
+            self.state_machine.transition(State.IDLE)
             return reflex
 
         # 2. Muscle Memory — try HNMA first
@@ -126,10 +136,12 @@ class KernelRuntimeV2:
         if muscle_result:
             self._muscle_hits += 1
             self._store_atom(user_input, muscle_result.output, source="muscle")
+            self.state_machine.transition(State.IDLE)
             return muscle_result.output
 
         # 3. Cortex — batched LLM inference
         self._cortex_calls += 1
+        self.state_machine.transition(State.CORTEX)
         cortex_output = await self._run_cortex(user_input, session_id)
 
         # 4. Compile to Muscle Memory (background)
@@ -138,6 +150,7 @@ class KernelRuntimeV2:
         # 5. Store context
         self._store_atom(user_input, cortex_output, source="cortex")
 
+        self.state_machine.transition(State.IDLE)
         latency_ms = (time.perf_counter() - start) * 1000
         return cortex_output
 
@@ -162,7 +175,6 @@ class KernelRuntimeV2:
         start = time.perf_counter()
 
         # Search L2/L3 for skill by keyword
-        # For now: simple keyword match against L2 cache names
         query_lower = user_input.lower()
         best_hash = None
         best_score = 0.0
@@ -227,8 +239,6 @@ class KernelRuntimeV2:
     async def _compile_to_muscle(self, user_input: str, output: str):
         """Background: compile interaction to Muscle Memory skill."""
         try:
-            # Simple heuristic: if output contains tool-like patterns, compile
-            # Full impl would parse ReAct trace
             trace_steps = [
                 {"tool": "terminal", "action_input": user_input},
             ]
@@ -257,7 +267,7 @@ class KernelRuntimeV2:
             )
             self.hnma.store_atom(atom.to_dict())
         except Exception:
-            pass  # Non-critical
+            pass
 
     # ── Stats & Diagnostics ──
     def get_stats_v2(self) -> Dict[str, Any]:
@@ -286,9 +296,6 @@ class KernelRuntimeV2:
         """Graceful shutdown."""
         if self.hnma:
             self.hnma.close()
-        if self.batcher:
-            # Batcher has no explicit shutdown, tasks complete naturally
-            pass
 
     # ── Background worker status (legacy compat) ──
     def get_background_status(self) -> str:
@@ -307,3 +314,9 @@ class KernelRuntimeV2:
             lines.append(f"Batches sent: {stats['batcher']['batches_sent']}")
             lines.append(f"Tasks batched: {stats['batcher']['tasks_batched']}")
         return "\n".join(lines)
+
+
+class _SkillLibraryStub:
+    """Stub for shutdown compat with main.py."""
+    def close(self):
+        pass
