@@ -21,6 +21,9 @@ from kernel.cortex.react_engine import ReactEngine, ReActTrace
 from kernel.skills.library import SkillLibrary, Skill, ExecutionStep
 from kernel.skills.brancher import SpeculativeBrancher
 from kernel.state_machine import StateMachine, State, Action, TransitionError
+from kernel.skills.vm_v2 import SkillVM
+from kernel.memory.hnma_controller import HNMAController
+from kernel.cortex.batcher import BatchingEngine
 from kernel.security.capabilities import (
     CapabilityManager,
     CapabilitySet,
