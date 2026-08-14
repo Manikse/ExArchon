@@ -163,7 +163,7 @@ Action Input: Disk usage: 45% used, 55% free.
 /dev/sda1  100G  45G  55G  45% /
 ```
 
-**No LLM call. No API cost. 50 milliseconds.**
+**No LLM call. No API cost. 50 milliseconds**
 
 ---
 
