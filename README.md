@@ -6,7 +6,7 @@
   <h1>EXARCHON</h1>
 
   <p>
-    <b>The Distributed Cognitive Operating System for Autonomous AI Agents.</b><br>
+    <b>The Distributed Cognitive Operating System for Autonomous AI Agents</b><br>
     Bridging probabilistic reasoning with deterministic execution, from the Cloud to the Edge
   </p>
 </div>
