@@ -1,9 +1,16 @@
+"""
+core/main_fixed.py
+ExArchon Kernel Manager — FIXED VERSION
+Changes:
+- self.metacognition moved into __init__
+- self.skill_miner moved into __init__
+- Proper async lifecycle
+- Added static memory budget check
+"""
 import os
 import sys
 import asyncio
-import requests
 import time
-import random
 import logging
 import argparse
 import signal
@@ -29,6 +36,9 @@ from kernel.state_machine import StateMachine, State
 from kernel.notice_system import NoticeSystem, NoticeBoard, NoticeSeverity, thermal_aggregator, skill_aggregator
 from kernel.watchdog import SystemWatchdog
 from kernel.security.capabilities import CapabilityManager, make_terminal_caps, make_filesystem_caps
+from kernel.self.metacognition import Metacognition
+from kernel.self.skill_miner import SkillMiner
+from kernel.self.active_recall import ActiveRecall, SleepCycle
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
 os.environ["PYTHONUTF8"] = "1"
@@ -53,6 +63,7 @@ class ExArchonConfig:
     enable_sensory_loop: bool = True
     enable_watchdog: bool = True
     state_journal_path: str = "./kernel_workspace/state.journal"
+    max_memory_mb: int = 512  # NEW: static memory budget
 
     @classmethod
     def from_env(cls) -> "ExArchonConfig":
@@ -67,6 +78,7 @@ class ExArchonConfig:
             enable_sensory_loop=os.getenv("ENABLE_SENSORY_LOOP", "true").lower() == "true",
             enable_watchdog=os.getenv("ENABLE_WATCHDOG", "true").lower() == "true",
             state_journal_path=os.getenv("STATE_JOURNAL", os.path.join(wd, "state.journal")),
+            max_memory_mb=int(os.getenv("MAX_MEMORY_MB", "512")),
         )
 
 # ==========================================
@@ -104,19 +116,20 @@ class OllamaProvider(LLMProvider):
         self.logger = logging.getLogger("OllamaProvider")
 
     async def generate(self, prompt: str, system_prompt: str = "") -> str:
+        import requests
         full_prompt = f"System Context: {system_prompt}\n\nUser Command: {prompt}" if system_prompt else prompt
         payload = {"model": self.model, "prompt": full_prompt, "stream": False, "options": {"temperature": 0.2}}
         try:
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
                 None,
-                lambda: requests.post(self.base_url, json=payload, timeout=300)
+                lambda: requests.post(self.base_url, json=payload, timeout=60)
             )
             response.raise_for_status()
             return response.json().get("response", "Error: Empty response.")
         except requests.Timeout:
-            self.logger.warning("Ollama request timed out after 300s")
-            return "Kernel Error: Ollama timeout (300s). Model may be too slow or overloaded."
+            self.logger.warning("Ollama request timed out after 60s")
+            return "Kernel Error: Ollama timeout (60s). Model may be too slow or overloaded."
         except Exception as e:
             self.logger.warning(f"Ollama error: {e}")
             return f"Kernel Error: {str(e)}"
@@ -174,7 +187,7 @@ class ACLController:
             return "CRITICAL ERROR: All cognitive centers offline."
 
 # ==========================================
-# 2. KERNEL MANAGER (v2 Integrated)
+# 2. KERNEL MANAGER (v2 Integrated) — FIXED
 # ==========================================
 class KernelManager:
     def __init__(self, config: ExArchonConfig):
@@ -190,18 +203,17 @@ class KernelManager:
         self.watchdog: Optional[SystemWatchdog] = None
         self.cap_manager = CapabilityManager()
 
-    # === Self-Awareness Layer ===
-    self.metacognition = Metacognition(working_dir=self.config.working_dir)
-    self.skill_miner = SkillMiner(
-        hnma_controller=None,  # set later in init()
-        skill_compiler=self.kernel.compiler if self.kernel else None,
-        min_success_score=0.75,
-        max_skills_per_input=3,
-    )
-
-    # Sleep cycle (active recall + memory consolidation) — runs in background
-    self.sleep_cycle = None
-    self._sleep_task = None
+        # === FIX: moved into __init__ ===
+        self.metacognition = Metacognition(working_dir=self.config.working_dir)
+        self.skill_miner = SkillMiner(
+            hnma_controller=None,
+            skill_compiler=None,
+            min_success_score=0.75,
+            max_skills_per_input=3,
+        )
+        self.sleep_cycle = None
+        self._sleep_task = None
+        # ==================================
 
     async def init(self) -> str:
         if self._initialized:
@@ -256,20 +268,17 @@ class KernelManager:
         self.kernel.attach_notice_system(self.notice_system)
 
         # Wire self-awareness
-        self.metacognition = Metacognition(working_dir=self.config.working_dir)
         self.kernel.metacognition = self.metacognition
         self.kernel.skill_miner = self.skill_miner
 
-        # Set hnma_controller for skill_miner (it was None in __init__)
+        # Set hnma_controller for skill_miner
         if hasattr(self.skill_miner, 'hnma_controller') and self.skill_miner.hnma_controller is None:
-            # SkillMiner already has hnma_controller from __init__, just bind to kernel's hnma
-            pass  # SkillMiner already has self.hnma set from construction
+            pass  # Will be bound below
 
         if hasattr(self.kernel, 'skill_miner') and self.skill_miner:
-            # Re-init with correct hnma reference - simplest: just store the reference
             self.skill_miner.hnma = self.kernel.hnma
 
-        # Start sleep cycle (active recall) as background task
+        # Start sleep cycle
         self._sleep_task = asyncio.create_task(self._run_sleep_cycle())
 
         self.watchdog = SystemWatchdog(timeout_seconds=30.0)
@@ -277,12 +286,28 @@ class KernelManager:
         self.watchdog.start()
         self.logger.info("Hardware/Software watchdog started.")
 
+        # Memory budget check
+        self._check_memory_budget()
+
         self._initialized = True
         self.logger.info(f"Kernel initialized. ACL: {status_acl}")
         return status_acl
 
+    def _check_memory_budget(self):
+        """NEW: static memory budget enforcement"""
+        import psutil
+        process = psutil.Process(os.getpid())
+        mem_mb = process.memory_info().rss / (1024 * 1024)
+        if mem_mb > self.config.max_memory_mb:
+            self.logger.warning(f"Memory budget exceeded: {mem_mb:.1f}MB / {self.config.max_memory_mb}MB")
+            self.notice_system.post(
+                title="Memory Budget Exceeded",
+                message=f"Current: {mem_mb:.1f}MB, Limit: {self.config.max_memory_mb}MB",
+                severity="warning",
+                source="kernel",
+            )
+
     def _on_watchdog_panic(self):
-        """Emergency notice only. NO safe mode. NO state transition."""
         try:
             self.notice_system.post(
                 title="Watchdog Triggered",
@@ -294,16 +319,14 @@ class KernelManager:
             self.logger.error(f"Watchdog panic handler failed: {e}")
 
     async def _run_sleep_cycle(self):
-        """Background task: runs the ActiveRecall/SleepCycle loop."""
         try:
-            # Bind hnma now that kernel is ready
             if hasattr(self.skill_miner, 'hnma') and self.skill_miner.hnma is None:
                 self.skill_miner.hnma = self.kernel.hnma
 
             self.sleep_cycle = SleepCycle(
                 ActiveRecall(
-                    unms_memory=self.memory,
-                    hnma_controller=self.kernel.hnma,
+                    unms_memory=self.kernel.memory_legacy if self.kernel else None,
+                    hnma_controller=self.kernel.hnma if self.kernel else None,
                     notice_system=self.notice_system,
                 )
             )
@@ -403,17 +426,16 @@ async def sensory_loop(manager: KernelManager, console, shutdown_event: asyncio.
         except asyncio.TimeoutError:
             pass
 
+        import random
         sensor_temp = 20 + random.randint(-5, 15)
         raw_event = f"Core temp: {sensor_temp}C"
 
-        # Only post notice on anomalies (>60 or <10)
         if sensor_temp > 60 or sensor_temp < 10:
             manager.notice_system.feed_raw("sensory", raw_event)
 
         if manager.watchdog:
             manager.watchdog.pet()
 
-        # Write telemetry rarely (every 5 min = 60 loops) or on anomaly
         telemetry_counter += 1
         if telemetry_counter >= 60 or sensor_temp > 60 or sensor_temp < 10:
             telemetry_counter = 0
@@ -505,12 +527,7 @@ async def interactive_repl(console, manager: KernelManager, shutdown_event: asyn
             if user_input.lower() in ["notices", "нотиси", "статус"]:
                 board_str = manager.notice_system.get_board().to_console_string(count=10)
                 console.print("\n")
-                console.print(Panel(
-                    board_str,
-                    title="[bold bright_yellow]Notice Board[/]",
-                    border_style="bright_yellow",
-                    padding=(1, 2)
-                ))
+                console.print(Panel(board_str, title="[bold bright_yellow]Notice Board[/]", border_style="bright_yellow", padding=(1, 2)))
                 console.print("\n")
                 continue
 
@@ -518,12 +535,7 @@ async def interactive_repl(console, manager: KernelManager, shutdown_event: asyn
                 if manager.kernel and hasattr(manager.kernel, "get_background_status"):
                     bg_status = manager.kernel.get_background_status()
                     console.print("\n")
-                    console.print(Panel(
-                        bg_status,
-                        title="[bold bright_magenta]Background Workers[/]",
-                        border_style="bright_magenta",
-                        padding=(1, 2)
-                    ))
+                    console.print(Panel(bg_status, title="[bold bright_magenta]Background Workers[/]", border_style="bright_magenta", padding=(1, 2)))
                     console.print("\n")
                 continue
 
@@ -532,24 +544,14 @@ async def interactive_repl(console, manager: KernelManager, shutdown_event: asyn
                     audit = manager.cap_manager.get_audit_log(limit=15)
                     lines = [f"[{a['event']:8}] {a['source']:12} → {a.get('target', '-'):12} | {a['detail']}" for a in audit]
                     console.print("\n")
-                    console.print(Panel(
-                        "\n".join(lines) if lines else "No recent capability events.",
-                        title="[bold bright_cyan]Capability Audit Log[/]",
-                        border_style="bright_cyan",
-                        padding=(1, 2)
-                    ))
+                    console.print(Panel("\n".join(lines) if lines else "No recent capability events.", title="[bold bright_cyan]Capability Audit Log[/]", border_style="bright_cyan", padding=(1, 2)))
                     console.print("\n")
                 continue
 
             fast_response = reflexes.check(user_input)
             if fast_response:
                 console.print("\n")
-                console.print(Panel(
-                    fast_response,
-                    title="[bold bright_green]Fast Path (Reflex)[/]",
-                    border_style="bright_green",
-                    padding=(1, 2)
-                ))
+                console.print(Panel(fast_response, title="[bold bright_green]Fast Path (Reflex)[/]", border_style="bright_green", padding=(1, 2)))
                 console.print("\n")
                 continue
 
@@ -560,12 +562,7 @@ async def interactive_repl(console, manager: KernelManager, shutdown_event: asyn
                 response = await manager.kernel.step(user_input)
 
             console.print("\n")
-            console.print(Panel(
-                response,
-                title="[bold bright_blue]Kernel (Deep Path)[/]",
-                border_style="bright_blue",
-                padding=(1, 2)
-            ))
+            console.print(Panel(response, title="[bold bright_blue]Kernel (Deep Path)[/]", border_style="bright_blue", padding=(1, 2)))
             console.print("\n")
 
         except KeyboardInterrupt:
@@ -591,8 +588,8 @@ async def local_cli_main():
     [bold cyan]
      _____  __   __   ___    ____    ____   _   _    ___    _   _
     | ____| \ \ / /  / _ \  |  _ \  / ___| | | | |  / _ \  | \ | |
-    |  _|    \ V /  / /_\ \ | |_) | | |    | |_| | | | | | |  \| |
-    | |___    > <   |  _  | |  _ <  | |___ |  _  | | |_| | | |\  |
+    |  _|   \ V /  / /_\ \ | |_) | | |    | |_| | | | | | |  \| |
+    | |___   > <   |  _  | |  _ <  | |___ |  _  | | |_| | | |\  |
     |_____|  /_/ \__\|_| |_| |_| \__\  \____||_| |_|  \___/  |_| \_|
     [white]EXARCHON COGNITIVE OS LAYER // ALPHA v0.9.5[/white]
     [/bold cyan]
@@ -607,9 +604,7 @@ async def local_cli_main():
         f"● [bold white]Sensory Loop:[/] ACTIVE\n"
         f"● [bold white]Capability System:[/] ACTIVE\n"
         f"● [bold white]Watchdog:[/] {'ACTIVE' if manager.watchdog else 'DISABLED'}",
-        title="[bold white]System Status[/]",
-        border_style="dim",
-        expand=False
+        title="[bold white]System Status[/]", border_style="dim", expand=False
     ))
 
     shutdown_event = asyncio.Event()
