@@ -56,6 +56,7 @@ class HNMAController:
         # L3: Episodic Disk (SQLite + compression)
         self.l3_path = os.path.join(base_path, "episodic.db")
         self._l3_conn: Optional[sqlite3.Connection] = None
+        self.l3_conn: Optional[sqlite3.Connection] = None  # public alias for compatibility
         self._init_l3()
 
         self.tiers = {
@@ -66,6 +67,8 @@ class HNMAController:
 
     def _init_l3(self):
         self._l3_conn = sqlite3.connect(self.l3_path, check_same_thread=False)
+        # Keep both aliases pointing to same connection
+        self.l3_conn = self._l3_conn
         self._l3_conn.row_factory = sqlite3.Row
         self._l3_conn.execute("PRAGMA journal_mode=WAL")
         self._l3_conn.execute("""
@@ -117,6 +120,33 @@ class HNMAController:
             self.tiers["L1"].miss_count += 1
         return entry
 
+    def query_skills(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Search CASS L1 skills by name/description. Returns dicts ready for VM execution.
+        """
+        try:
+            entries = self.l1.search(query, limit=limit)
+            results = []
+            for e in entries:
+                h = e.skill_hash
+                # Warm L2 cache for fast subsequent access
+                self.l2_put(h, e)
+                self.tiers["L1"].hit_count += 1
+                results.append({
+                    "hash": h,
+                    "name": e.name,
+                    "description": e.description,
+                    "bytecode": e.bytecode,
+                    "preconditions": e.preconditions,
+                })
+            return results
+        except Exception:
+            return []
+
+    def store_cass(self, name: str, bytecode: bytes, description: str = "") -> bytes:
+        """Direct L1 CASS store (flash skills). Alias for store_skill."""
+        return self.store_skill(name, bytecode, description)
+
     # ── L2: Working RAM ──
     def l2_put(self, key: bytes, value: CASSEntry):
         key_str = key.hex()
@@ -139,8 +169,26 @@ class HNMAController:
 
     # ── L3: Episodic Disk ──
     def store_atom(self, atom: Dict[str, Any]):
-        raw = atom.get("raw_content", "").encode("utf-8")
-        compressed = _COMPRESS(raw) if len(raw) > 256 else raw
+        """Store atom dict. Accepts either hex-str or bytes atom_id/prev_hash."""
+        raw = atom.get("raw_content", "")
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        raw_bytes = raw.encode("utf-8")
+        compressed = _COMPRESS(raw_bytes) if len(raw_bytes) > 256 else raw_bytes
+
+        # Normalize atom_id / prev_hash to bytes
+        atom_id = atom["atom_id"]
+        if isinstance(atom_id, str):
+            atom_id = bytes.fromhex(atom_id)
+        prev_hash = atom.get("prev_hash")
+        if isinstance(prev_hash, str) and prev_hash:
+            prev_hash = bytes.fromhex(prev_hash)
+        elif prev_hash is None:
+            prev_hash = b""
+
+        intent_emb = atom.get("intent_embedding", b"")
+        if isinstance(intent_emb, str) and intent_emb:
+            intent_emb = bytes.fromhex(intent_emb)
 
         with self._l3_conn:
             self._l3_conn.execute("""
@@ -149,10 +197,10 @@ class HNMAController:
                  summary, raw_content, importance, access_count)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                atom["atom_id"],
-                atom.get("prev_hash"),
+                atom_id,
+                prev_hash,
                 atom["timestamp_ns"],
-                atom.get("intent_embedding"),
+                intent_emb,
                 atom.get("facts_json", "[]"),
                 atom.get("summary", ""),
                 compressed,
@@ -160,16 +208,41 @@ class HNMAController:
                 atom.get("access_count", 0),
             ))
 
-    def query_episodic(self, query: str, limit: int = 10) -> List[Dict]:
-        rows = self._l3_conn.execute("""
-            SELECT * FROM context_atoms
-            WHERE summary LIKE ?
-            ORDER BY importance DESC, timestamp_ns DESC
-            LIMIT ?
-        """, (f"%{query}%", limit)).fetchall()
-        return [dict(r) for r in rows]
+    def query_episodic(self, query: str, limit: int = 5) -> list:
+        """
+        Search L3 Episodic memory (SQLite) for relevant atoms.
+        Returns list of dicts with 'summary' and 'timestamp'.
+        """
+        try:
+            conn = self._l3_conn if self._l3_conn is not None else self.l3_conn
+            if conn is None:
+                return []
+
+            # Simple FTS-like search: match any word from query
+            words = [w for w in query.lower().split() if len(w) > 3]
+            if not words:
+                return []
+
+            # Build OR query against correct table context_atoms
+            conditions = " OR ".join(["summary LIKE ?" for _ in words])
+            params = [f"%{w}%" for w in words] + [limit]
+
+            cursor = conn.execute(
+                f"SELECT summary, timestamp_ns FROM context_atoms WHERE {conditions} ORDER BY timestamp_ns DESC LIMIT ?",
+                params
+            )
+            rows = []
+            for row in cursor.fetchall():
+                rows.append({"summary": row[0], "timestamp": row[1]})
+            return rows
+        except Exception:
+            return []
 
     def get_atom_by_hash(self, atom_id: bytes) -> Optional[Dict]:
+        """Lookup atom by hash. Accepts bytes; also handles hex-str input."""
+        if isinstance(atom_id, str):
+            atom_id = bytes.fromhex(atom_id)
+
         row = self._l3_conn.execute(
             "SELECT * FROM context_atoms WHERE atom_id = ?", (atom_id,)
         ).fetchone()
@@ -178,9 +251,16 @@ class HNMAController:
         result = dict(row)
         raw = result.get("raw_content", b"")
         try:
-            result["raw_content"] = _DECOMPRESS(raw).decode("utf-8")
+            decompressed = _DECOMPRESS(raw)
+            result["raw_content"] = decompressed.decode("utf-8")
         except Exception:
             result["raw_content"] = raw.decode("utf-8", errors="replace")
+        # Convert bytes back to hex for dict consumers
+        for k in ("atom_id", "prev_hash"):
+            v = result.get(k)
+            if isinstance(v, bytes):
+                result[k] = v.hex()
+        result["timestamp"] = result.get("timestamp_ns")
         return result
 
     def drill_down(self, start_atom_id: bytes, steps: int = 5) -> List[Dict]:
@@ -191,9 +271,11 @@ class HNMAController:
             if not atom:
                 break
             chain.append(atom)
-            current = atom.get("prev_hash")
-            if not current:
+            prev = atom.get("prev_hash")
+            if not prev:
                 break
+            # prev_hash is hex string after get_atom_by_hash conversion
+            current = prev
         return chain
 
     def query_working(self, query: str) -> str:
@@ -223,3 +305,4 @@ class HNMAController:
             self._l3_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             self._l3_conn.close()
             self._l3_conn = None
+            self.l3_conn = None

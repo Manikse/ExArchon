@@ -117,17 +117,24 @@ Original request: {user_input}
 Solve using available tools. Think step by step.
 """
         try:
-            # Run LLM call — if it's CPU-bound, offload to ProcessPool
-            # For now, assume acl.execute is async I/O
+            # Use the full ReAct engine if attached, so tools are actually executed.
+            if getattr(self, '_react_engine', None) is not None:
+                trace = await self._react_engine.run(prompt, session_id)
+                elapsed = (time.time() - start) * 1000
+                return HypothesisResult(hypothesis, trace, elapsed)
+
             raw = await asyncio.wait_for(
                 self.acl.execute(prompt),
                 timeout=self.llm_timeout,
             )
-            # Parse simple trace
             trace = ReActTrace(user_input=user_input)
-            trace.success = True
-            trace.final_answer = raw
-            trace.steps = []  # Simplified for branching
+            if raw and len(raw.strip()) > 10:
+                trace.success = True
+                trace.final_answer = raw
+            else:
+                trace.success = False
+                trace.final_answer = f"[Brancher] Empty response for hypothesis: {hypothesis}"
+            trace.steps = []
             elapsed = (time.time() - start) * 1000
             return HypothesisResult(hypothesis, trace, elapsed)
         except asyncio.TimeoutError:

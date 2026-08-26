@@ -9,6 +9,8 @@ from enum import IntEnum
 from typing import Dict, List, Callable, Optional, Any
 from dataclasses import dataclass, field
 
+from kernel.security.capabilities import CapOp
+
 
 class OpCode(IntEnum):
     EXEC = 0x00
@@ -86,15 +88,24 @@ class SkillVM:
                     pc += arg_len
 
                     tool_name = self.TOOL_IDS.get(tool_id, "unknown")
+
+                    # Built-in drivers that need no external dependency
+                    if tool_name == "respond":
+                        stack.append(arg)
+                        continue
+                    if tool_name == "notice":
+                        stack.append(f"[notice] {arg}")
+                        continue
+
                     driver = self.drivers.get(tool_name)
 
                     if driver is None:
                         stack.append(f"[VM ERROR] Unknown driver: {tool_name}")
                         continue
 
-                    # Capability check inline
+                    # Capability check inline — use CapOp.EXEC enum
                     if self._cap_manager:
-                        ok, reason = self._cap_manager.validate(tool_name, "exec", arg)
+                        ok, reason = self._cap_manager.validate(tool_name, CapOp.EXEC, arg)
                         if not ok:
                             stack.append(f"[CAPABILITY DENIED] {reason}")
                             continue
@@ -133,6 +144,11 @@ class SkillVM:
                         except ValueError:
                             cond_met = False
 
+                    # Guard against infinite loops: if offset points back to self, stop
+                    if true_off == 0:
+                        true_off = pc
+                    if false_off == 0:
+                        false_off = pc
                     pc = true_off if cond_met else false_off
 
                 elif op == OpCode.LOOP:
@@ -182,7 +198,8 @@ class SkillVM:
                     pc += cap_len
 
                     if self._cap_manager:
-                        ok, _ = self._cap_manager.validate("vm", "exec", cap_str)
+                        # CAP opcode requests a permission — validate as EXEC on the cap_str
+                        ok, _ = self._cap_manager.validate("vm", CapOp.EXEC, cap_str)
                         if not ok:
                             stack.append(f"[CAPABILITY DENIED] {cap_str}")
                             break

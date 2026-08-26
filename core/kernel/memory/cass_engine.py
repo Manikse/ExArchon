@@ -157,6 +157,49 @@ class CASSEngine:
             created_at=meta.get("created_at", 0.0),
         )
 
+    def search(self, query: str, limit: int = 5) -> List[CASSEntry]:
+        """
+        Search skills by name/description (naive scan, fine for small L1).
+        Returns up to `limit` entries whose name/description contains query terms.
+        """
+        query_lower = query.lower().strip()
+        if not query_lower:
+            return []
+
+        matches: List[CASSEntry] = []
+        for h in self._index.keys():
+            entry = self.load(h)
+            if not entry:
+                continue
+            haystack = (entry.name + " " + entry.description).lower()
+            # Score: exact name > contains > word overlap
+            if entry.name.lower() == query_lower:
+                score = 2.0
+            elif query_lower in haystack:
+                score = 1.0
+            else:
+                q_words = set(query_lower.split())
+                h_words = set(haystack.split())
+                overlap = len(q_words & h_words)
+                score = overlap / max(len(q_words), 1)
+            if score >= 0.5:
+                entry.skill_hash = h
+                matches.append(entry)
+
+        matches.sort(key=lambda e: self._score(query_lower, e), reverse=True)
+        return matches[:limit]
+
+    @staticmethod
+    def _score(query_lower: str, entry: CASSEntry) -> float:
+        haystack = (entry.name + " " + entry.description).lower()
+        if entry.name.lower() == query_lower:
+            return 2.0
+        if query_lower in haystack:
+            return 1.0
+        q_words = set(query_lower.split())
+        h_words = set(haystack.split())
+        return len(q_words & h_words) / max(len(q_words), 1)
+
     def get_stats(self) -> Dict:
         total_size = os.path.getsize(self.path) if os.path.exists(self.path) else 0
         return {

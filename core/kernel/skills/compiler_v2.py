@@ -25,13 +25,21 @@ class SkillCompiler:
         Compile skill with conditions.
         nodes: [
             {"type": "exec", "tool": "terminal", "input": "df -h"},
-            {"type": "cond", "reg": 0, "cmp": ">", "val": "90", "true": [...], "false": [...]},
+            {"type": "cond", "reg": 0, "cmp": ">", "val": "90", "true": 2, "false": 3},
         ]
+        The `true`/`false` fields can be node indices (which we resolve to offsets),
+        or explicit bytecode offsets. If absent, defaults to the next node (fall-through).
         """
         bytecode = bytearray()
-        jump_fixups = []  # (offset_in_bytecode, target_node_index)
+        jump_fixups = []  # (true_off_pos, false_off_pos, true_target, false_target)
+
+        # First pass: emit opcodes, record jump fixup positions and node start offsets.
+        # Node index -> bytecode offset map
+        node_offsets = {}
+        current_offset = 0
 
         for i, node in enumerate(nodes):
+            node_offsets[i] = current_offset
             node_type = node.get("type", "exec")
 
             if node_type == "exec":
@@ -45,6 +53,7 @@ class SkillCompiler:
                 bytecode.append(tid)
                 bytecode.extend(struct.pack("<H", len(arg)))
                 bytecode.extend(arg)
+                current_offset = len(bytecode)
 
             elif node_type == "cond":
                 reg = node.get("reg", 0)
@@ -52,7 +61,7 @@ class SkillCompiler:
                 cmp_op = cmp_map.get(node.get("cmp", "=="), 0)
                 val = str(node.get("val", "")).encode("utf-8")
 
-                # Reserve space for offsets (fixed later if needed)
+                # Reserve space for offsets (fixed later via fixups)
                 bytecode.append(OpCode.COND)
                 bytecode.append(reg)
                 bytecode.append(cmp_op)
@@ -64,8 +73,11 @@ class SkillCompiler:
                 bytecode.extend(struct.pack("<H", 0))
                 bytecode.extend(struct.pack("<H", len(val)))
                 bytecode.extend(val)
+                current_offset = len(bytecode)
 
-                jump_fixups.append((true_off_pos, false_off_pos, node.get("true_idx", i+1), node.get("false_idx", i+1)))
+                true_target = node.get("true", i + 1)
+                false_target = node.get("false", i + 1)
+                jump_fixups.append((true_off_pos, false_off_pos, true_target, false_target))
 
             elif node_type == "memq":
                 query = str(node.get("query", "")).encode("utf-8")
@@ -74,6 +86,7 @@ class SkillCompiler:
                 bytecode.extend(struct.pack("<H", len(query)))
                 bytecode.extend(query)
                 bytecode.append(dest)
+                current_offset = len(bytecode)
 
             elif node_type == "llm":
                 prompt = str(node.get("prompt", "")).encode("utf-8")
@@ -82,15 +95,37 @@ class SkillCompiler:
                 bytecode.extend(struct.pack("<H", len(prompt)))
                 bytecode.extend(prompt)
                 bytecode.append(dest)
+                current_offset = len(bytecode)
 
             elif node_type == "cap":
                 cap = str(node.get("cap", "")).encode("utf-8")
                 bytecode.append(OpCode.CAP)
                 bytecode.extend(struct.pack("<H", len(cap)))
                 bytecode.extend(cap)
+                current_offset = len(bytecode)
 
+        # Record the final offset (RETURN instruction position)
+        final_offset = len(bytecode)
         bytecode.append(OpCode.RETURN)
         bytecode.append(0)
+
+        # Second pass: apply jump fixups now that all offsets are known.
+        for true_off_pos, false_off_pos, true_target, false_target in jump_fixups:
+            # Resolve targets: if int and it's a node index, use node_offsets; else treat as absolute offset.
+            def resolve(target, default_offset):
+                if isinstance(target, int):
+                    if target in node_offsets:
+                        return node_offsets[target]
+                    if 0 <= target < final_offset:
+                        return target  # Already an absolute bytecode offset
+                return default_offset
+
+            true_off = resolve(true_target, node_offsets.get(true_target, final_offset))
+            false_off = resolve(false_target, node_offsets.get(false_target, final_offset))
+
+            struct.pack_into("<H", bytecode, true_off_pos, true_off)
+            struct.pack_into("<H", bytecode, false_off_pos, false_off)
+
         return bytes(bytecode)
 
     def compile_from_trace(self, trace_steps: List[Dict]) -> bytes:

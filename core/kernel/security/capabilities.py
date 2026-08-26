@@ -25,6 +25,7 @@ class CapOp(Enum):
     """Типи операцій, які kernel може авторизувати."""
     READ = auto()
     WRITE = auto()
+    DELETE = auto()
     EXEC = auto()
     NETWORK = auto()
     SPAWN = auto()
@@ -39,14 +40,14 @@ class CapabilityToken:
     Незмінний capability token.
 
     Поля:
-        token_id: унікальний UUID токена
-        issuer: хто видав ("kernel", "operator", "parent_skill")
-        issued_at: timestamp видачі
-        expires_at: 0 = ніколи, інакше unix timestamp
-        ops: множина дозволених операцій
-        targets: шаблони цілей (fnmatch-style), наприклад "./workspace/*", "df", "ping"
-        conditions: додаткові умови ("no_shell=True", "max_timeout=30")
-        parent_token: ID батьківського токена (для ланцюжка делегування)
+    token_id: унікальний UUID токена
+    issuer: хто видав ("kernel", "operator", "parent_skill")
+    issued_at: timestamp видачі
+    expires_at: 0 = ніколи, інакше unix timestamp
+    ops: множина дозволених операцій
+    targets: шаблони цілей (fnmatch-style), наприклад "./workspace/*", "df*", "ping*"
+    conditions: додаткові умови ("no_shell=True", "max_timeout=30")
+    parent_token: ID батьківського токена (для ланцюжка делегування)
     """
     token_id: str
     issuer: str
@@ -255,12 +256,15 @@ class CapabilityManager:
 # Kernel може видавати більш обмежені або розширені токени за потреби.
 
 def make_terminal_caps(working_dir: str = "./kernel_workspace") -> CapabilitySet:
-    """Базові capabilities для TerminalDriver — тільки читання та безпечні команди."""
+    """Базові capabilities для TerminalDriver — wildcard patterns для аргументів."""
     cs = CapabilitySet(owner="terminal")
     cs.add(CapabilityToken.create(
         issuer="kernel",
         ops=(CapOp.EXEC,),
-        targets=("df", "ls", "ps", "cat", "pwd", "whoami", "uptime", "echo", "uname", "top", "free", "du"),
+        targets=("df*", "ls*", "ps*", "cat*", "pwd", "whoami", "uptime", "echo*",
+                 "uname*", "top*", "free*", "du*", "netstat*", "ss*", "ip*",
+                 "ping*", "traceroute*", "curl*", "wget*", "git*", "python*",
+                 "node*", "npm*", "yarn*", "make*", "gcc*", "g++*", "clang*"),
         conditions=("no_shell=True", "max_timeout=30"),
     ))
     cs.add(CapabilityToken.create(
@@ -276,8 +280,9 @@ def make_filesystem_caps(working_dir: str = "./kernel_workspace") -> CapabilityS
     cs = CapabilitySet(owner="file_system")
     cs.add(CapabilityToken.create(
         issuer="kernel",
-        ops=(CapOp.READ,),
-        targets=(f"{working_dir}/*", f"{working_dir}/**/*"),
+        ops=(CapOp.READ, CapOp.WRITE, CapOp.DELETE),
+        targets=(f"{working_dir}/*", f"{working_dir}/**/*", "/tmp/*", "/var/tmp/*"),
+        conditions=("no_escape=True",),
     ))
     # WRITE тільки через explicit PATCH approval (видається runtime на момент операції)
     cs.add(CapabilityToken.create(
