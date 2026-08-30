@@ -27,9 +27,9 @@
 
 ## Vision
 
-The next evolution of artificial intelligence requires moving beyond conversational interfaces. EXARCHON is designed as a foundational Cognitive OS layer that bridges Large Language Models with independent, real-world execution.
+The next evolution of artificial intelligence requires moving beyond conversational interfaces. EXARCHON is designed as a foundational Cognitive OS layer that bridges Large Language Models with independent, real-world execution
 
-It is not an API wrapper. It is the core infrastructure for an AI-native operating system capable of **reasoning**, **persistent memory**, **self-learning**, and **autonomous action** — whether running as a highly scalable Cloud API or a completely offline Edge Node.
+It is not an API wrapper. It is the core infrastructure for an AI-native operating system capable of **reasoning**, **persistent memory**, **self-learning**, and **autonomous action** — whether running as a highly scalable Cloud API or a completely offline Edge Node
 
 ---
 
