@@ -35,7 +35,7 @@ class VMConfig:
     max_steps: int = 1000
     max_time_ms: int = 5000
     stack_size: int = 256
-    max_fuel: u64 = 100_000  # NEW: instruction budget
+    max_fuel: int = 100_000
 
 
 @dataclass
@@ -144,7 +144,7 @@ class SkillVM:
                         # Check if we're inside a FALLBACK block
                         if exception_stack:
                             frame = exception_stack.pop()
-                            stack.truncate(frame.stack_depth)
+                            stack = stack[:frame.stack_depth]
                             pc = frame.catch_pc
                             stack.append(f"[CAUGHT] {type(e).__name__}: {e}")
                         else:

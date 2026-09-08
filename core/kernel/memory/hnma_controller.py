@@ -1,15 +1,16 @@
 """
 kernel/memory/hnma_controller.py
-Hierarchical Neural Memory Architecture v2.
+Hierarchical Neural Memory Architecture v3.
 L1: CASS mmap (Muscle Flash)
 L2: Working RAM (LRU + embeddings)
-L3: Episodic Disk (SQLite + brotli summaries)
+L3: Episodic Disk (SQLite + FTS5 + Vector Search + brotli summaries)
 """
 import os
 import time
 import sqlite3
+import json
 from collections import OrderedDict
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 
 from kernel.memory.cass_engine import CASSEngine, CASSEntry
@@ -26,6 +27,13 @@ except ImportError:
     _DECOMPRESS = lambda data: zlib.decompress(data)
     _COMPRESSION_NAME = "zlib"
 
+# Optional sentence-transformers for semantic search
+try:
+    from sentence_transformers import SentenceTransformer
+    _EMBEDDINGS_AVAILABLE = True
+except ImportError:
+    _EMBEDDINGS_AVAILABLE = False
+
 
 @dataclass
 class MemoryTier:
@@ -38,7 +46,8 @@ class MemoryTier:
 
 class HNMAController:
     """
-    HNMA v2 — manages L1 Muscle Flash, L2 Working RAM, L3 Episodic Disk.
+    HNMA v3 — manages L1 Muscle Flash, L2 Working RAM, L3 Episodic Disk.
+    Now with FTS5 full-text search and optional semantic (vector) search.
     """
 
     def __init__(self, base_path: str = "./kernel_workspace"):
@@ -53,11 +62,15 @@ class HNMAController:
         self.l2_max_items = 500
         self.l2_embeddings: Dict[str, bytes] = {}
 
-        # L3: Episodic Disk (SQLite + compression)
+        # L3: Episodic Disk (SQLite + FTS5 + compression)
         self.l3_path = os.path.join(base_path, "episodic.db")
         self._l3_conn: Optional[sqlite3.Connection] = None
-        self.l3_conn: Optional[sqlite3.Connection] = None  # public alias for compatibility
+        self.l3_conn: Optional[sqlite3.Connection] = None
         self._init_l3()
+
+        # Semantic search model (lazy-loaded)
+        self._embedder: Optional[Any] = None
+        self._embedding_dim: int = 384  # all-MiniLM-L6-v2
 
         self.tiers = {
             "L1": MemoryTier("L1_muscle", 100 * 1024 * 1024),
@@ -67,10 +80,12 @@ class HNMAController:
 
     def _init_l3(self):
         self._l3_conn = sqlite3.connect(self.l3_path, check_same_thread=False)
-        # Keep both aliases pointing to same connection
         self.l3_conn = self._l3_conn
         self._l3_conn.row_factory = sqlite3.Row
         self._l3_conn.execute("PRAGMA journal_mode=WAL")
+        self._l3_conn.execute("PRAGMA synchronous=NORMAL")
+
+        # Main atoms table
         self._l3_conn.execute("""
             CREATE TABLE IF NOT EXISTS context_atoms (
                 atom_id BLOB PRIMARY KEY,
@@ -84,12 +99,77 @@ class HNMAController:
                 access_count INTEGER DEFAULT 0
             )
         """)
+
+        # FTS5 virtual table for full-text search
+        self._l3_conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS context_atoms_fts USING fts5(
+                summary, facts_json,
+                content='context_atoms',
+                content_rowid='rowid'
+            )
+        """)
+
+        # Triggers to keep FTS5 in sync
+        self._l3_conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS atoms_fts_insert AFTER INSERT ON context_atoms BEGIN
+                INSERT INTO context_atoms_fts(rowid, summary, facts_json)
+                VALUES (new.rowid, new.summary, new.facts_json);
+            END
+        """)
+        self._l3_conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS atoms_fts_delete AFTER DELETE ON context_atoms BEGIN
+                INSERT INTO context_atoms_fts(context_atoms_fts, rowid, summary, facts_json)
+                VALUES ('delete', old.rowid, old.summary, old.facts_json);
+            END
+        """)
+        self._l3_conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS atoms_fts_update AFTER UPDATE ON context_atoms BEGIN
+                INSERT INTO context_atoms_fts(context_atoms_fts, rowid, summary, facts_json)
+                VALUES ('delete', old.rowid, old.summary, old.facts_json);
+                INSERT INTO context_atoms_fts(rowid, summary, facts_json)
+                VALUES (new.rowid, new.summary, new.facts_json);
+            END
+        """)
+
         self._l3_conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_atoms_time ON context_atoms(timestamp_ns)
         """)
         self._l3_conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_atoms_importance ON context_atoms(importance DESC)
         """)
+
+    # ── Semantic Embeddings ──
+    def _get_embedder(self):
+        if self._embedder is None and _EMBEDDINGS_AVAILABLE:
+            try:
+                self._embedder = SentenceTransformer("all-MiniLM-L6-v2")
+            except Exception:
+                self._embedder = None
+        return self._embedder
+
+    def _embed(self, text: str) -> Optional[bytes]:
+        model = self._get_embedder()
+        if model is None:
+            return None
+        try:
+            vec = model.encode(text, convert_to_numpy=True)
+            return vec.astype("float32").tobytes()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _cosine_similarity(a: bytes, b: bytes) -> float:
+        import numpy as np
+        va = np.frombuffer(a, dtype="float32")
+        vb = np.frombuffer(b, dtype="float32")
+        if len(va) != len(vb):
+            return 0.0
+        dot = np.dot(va, vb)
+        na = np.linalg.norm(va)
+        nb = np.linalg.norm(vb)
+        if na == 0 or nb == 0:
+            return 0.0
+        return float(dot / (na * nb))
 
     # ── L1: Muscle Flash ──
     def store_skill(self, name: str, bytecode: bytes, description: str = "", preconditions: str = "[]") -> bytes:
@@ -121,15 +201,11 @@ class HNMAController:
         return entry
 
     def query_skills(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
-        """
-        Search CASS L1 skills by name/description. Returns dicts ready for VM execution.
-        """
         try:
             entries = self.l1.search(query, limit=limit)
             results = []
             for e in entries:
                 h = e.skill_hash
-                # Warm L2 cache for fast subsequent access
                 self.l2_put(h, e)
                 self.tiers["L1"].hit_count += 1
                 results.append({
@@ -144,7 +220,6 @@ class HNMAController:
             return []
 
     def store_cass(self, name: str, bytecode: bytes, description: str = "") -> bytes:
-        """Direct L1 CASS store (flash skills). Alias for store_skill."""
         return self.store_skill(name, bytecode, description)
 
     # ── L2: Working RAM ──
@@ -169,14 +244,12 @@ class HNMAController:
 
     # ── L3: Episodic Disk ──
     def store_atom(self, atom: Dict[str, Any]):
-        """Store atom dict. Accepts either hex-str or bytes atom_id/prev_hash."""
         raw = atom.get("raw_content", "")
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", errors="replace")
         raw_bytes = raw.encode("utf-8")
         compressed = _COMPRESS(raw_bytes) if len(raw_bytes) > 256 else raw_bytes
 
-        # Normalize atom_id / prev_hash to bytes
         atom_id = atom["atom_id"]
         if isinstance(atom_id, str):
             atom_id = bytes.fromhex(atom_id)
@@ -190,6 +263,13 @@ class HNMAController:
         if isinstance(intent_emb, str) and intent_emb:
             intent_emb = bytes.fromhex(intent_emb)
 
+        # Generate embedding if not provided and model available
+        summary = atom.get("summary", "")
+        if (not intent_emb or len(intent_emb) == 0) and summary:
+            emb = self._embed(summary)
+            if emb:
+                intent_emb = emb
+
         with self._l3_conn:
             self._l3_conn.execute("""
                 INSERT OR REPLACE INTO context_atoms
@@ -202,44 +282,70 @@ class HNMAController:
                 atom["timestamp_ns"],
                 intent_emb,
                 atom.get("facts_json", "[]"),
-                atom.get("summary", ""),
+                summary,
                 compressed,
                 atom.get("importance", 0.5),
                 atom.get("access_count", 0),
             ))
 
     def query_episodic(self, query: str, limit: int = 5) -> list:
-        """
-        Search L3 Episodic memory (SQLite) for relevant atoms.
-        Returns list of dicts with 'summary' and 'timestamp'.
-        """
+        """Search L3 using FTS5 full-text search first, then semantic fallback."""
         try:
             conn = self._l3_conn if self._l3_conn is not None else self.l3_conn
             if conn is None:
                 return []
 
-            # Simple FTS-like search: match any word from query
+            # 1. Try FTS5 full-text search
+            try:
+                cursor = conn.execute(
+                    """SELECT summary, timestamp_ns, intent_embedding, facts_json
+                       FROM context_atoms
+                       WHERE rowid IN (
+                           SELECT rowid FROM context_atoms_fts
+                           WHERE context_atoms_fts MATCH ?
+                           ORDER BY rank
+                       )
+                       ORDER BY timestamp_ns DESC
+                       LIMIT ?""",
+                    (query, limit)
+                )
+                rows = cursor.fetchall()
+                if rows:
+                    return [{"summary": r[0], "timestamp": r[1], "facts": r[3]} for r in rows]
+            except Exception:
+                pass  # FTS5 might fail if query has special chars
+
+            # 2. Fallback: semantic search with embeddings
+            query_emb = self._embed(query)
+            if query_emb:
+                cursor = conn.execute(
+                    "SELECT summary, timestamp_ns, intent_embedding, facts_json FROM context_atoms ORDER BY timestamp_ns DESC LIMIT 200"
+                )
+                scored = []
+                for row in cursor.fetchall():
+                    emb = row[2]
+                    if emb:
+                        sim = self._cosine_similarity(query_emb, emb)
+                        if sim > 0.5:
+                            scored.append((sim, row))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                return [{"summary": r[1][0], "timestamp": r[1][1], "facts": r[1][3], "similarity": r[0]} for r in scored[:limit]]
+
+            # 3. Last fallback: simple LIKE
             words = [w for w in query.lower().split() if len(w) > 3]
             if not words:
                 return []
-
-            # Build OR query against correct table context_atoms
             conditions = " OR ".join(["summary LIKE ?" for _ in words])
             params = [f"%{w}%" for w in words] + [limit]
-
             cursor = conn.execute(
-                f"SELECT summary, timestamp_ns FROM context_atoms WHERE {conditions} ORDER BY timestamp_ns DESC LIMIT ?",
+                f"SELECT summary, timestamp_ns, facts_json FROM context_atoms WHERE {conditions} ORDER BY timestamp_ns DESC LIMIT ?",
                 params
             )
-            rows = []
-            for row in cursor.fetchall():
-                rows.append({"summary": row[0], "timestamp": row[1]})
-            return rows
+            return [{"summary": r[0], "timestamp": r[1], "facts": r[2]} for r in cursor.fetchall()]
         except Exception:
             return []
 
     def get_atom_by_hash(self, atom_id: bytes) -> Optional[Dict]:
-        """Lookup atom by hash. Accepts bytes; also handles hex-str input."""
         if isinstance(atom_id, str):
             atom_id = bytes.fromhex(atom_id)
 
@@ -255,7 +361,6 @@ class HNMAController:
             result["raw_content"] = decompressed.decode("utf-8")
         except Exception:
             result["raw_content"] = raw.decode("utf-8", errors="replace")
-        # Convert bytes back to hex for dict consumers
         for k in ("atom_id", "prev_hash"):
             v = result.get(k)
             if isinstance(v, bytes):
@@ -274,7 +379,6 @@ class HNMAController:
             prev = atom.get("prev_hash")
             if not prev:
                 break
-            # prev_hash is hex string after get_atom_by_hash conversion
             current = prev
         return chain
 
@@ -296,6 +400,7 @@ class HNMAController:
             "L3_atoms": l3_count,
             "L3_size_mb": round(l3_size / (1024 * 1024), 2),
             "compression": _COMPRESSION_NAME,
+            "embeddings_available": _EMBEDDINGS_AVAILABLE,
             "tier_hits": {k: v.hit_count for k, v in self.tiers.items()},
             "tier_misses": {k: v.miss_count for k, v in self.tiers.items()},
         }

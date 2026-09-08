@@ -1,11 +1,13 @@
 """
-core/main_fixed.py
-ExArchon Kernel Manager — FIXED VERSION
-Changes:
-- self.metacognition moved into __init__
-- self.skill_miner moved into __init__
-- Proper async lifecycle
-- Added static memory budget check
+core/main.py
+ExArchon Kernel Manager — Production-Ready Entry Point.
+
+Changes from previous version:
+- Ollama health check with clear error messages
+- Automatic model download suggestion
+- Portable LTL Safety Monitor integration
+- Better shutdown handling
+- Clear startup diagnostics
 """
 import os
 import sys
@@ -36,6 +38,7 @@ from kernel.state_machine import StateMachine, State
 from kernel.notice_system import NoticeSystem, NoticeBoard, NoticeSeverity, thermal_aggregator, skill_aggregator
 from kernel.watchdog import SystemWatchdog
 from kernel.security.capabilities import CapabilityManager, make_terminal_caps, make_filesystem_caps
+from kernel.security.monitor_portable import create_default_monitor, LTLMonitor
 from kernel.self.metacognition import Metacognition
 from kernel.self.skill_miner import SkillMiner
 from kernel.self.active_recall import ActiveRecall, SleepCycle
@@ -62,8 +65,9 @@ class ExArchonConfig:
     log_level: str = "INFO"
     enable_sensory_loop: bool = True
     enable_watchdog: bool = True
+    enable_monitor: bool = True
     state_journal_path: str = "./kernel_workspace/state.journal"
-    max_memory_mb: int = 512  # NEW: static memory budget
+    max_memory_mb: int = 512
 
     @classmethod
     def from_env(cls) -> "ExArchonConfig":
@@ -77,6 +81,7 @@ class ExArchonConfig:
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             enable_sensory_loop=os.getenv("ENABLE_SENSORY_LOOP", "true").lower() == "true",
             enable_watchdog=os.getenv("ENABLE_WATCHDOG", "true").lower() == "true",
+            enable_monitor=os.getenv("ENABLE_MONITOR", "true").lower() == "true",
             state_journal_path=os.getenv("STATE_JOURNAL", os.path.join(wd, "state.journal")),
             max_memory_mb=int(os.getenv("MAX_MEMORY_MB", "512")),
         )
@@ -112,24 +117,61 @@ class OpenRouterProvider(LLMProvider):
 class OllamaProvider(LLMProvider):
     def __init__(self, model="qwen2.5:7b", base_url="http://localhost:11434"):
         self.model = model
-        self.base_url = f"{base_url}/api/generate"
+        self.base_url = base_url.rstrip("/")
+        self.generate_url = f"{self.base_url}/api/generate"
         self.logger = logging.getLogger("OllamaProvider")
 
-    async def generate(self, prompt: str, system_prompt: str = "") -> str:
-        import requests
-        full_prompt = f"System Context: {system_prompt}\n\nUser Command: {prompt}" if system_prompt else prompt
-        payload = {"model": self.model, "prompt": full_prompt, "stream": False, "options": {"temperature": 0.2}}
+    async def _check_ollama_running(self) -> tuple[bool, str]:
+        """Check if Ollama server is reachable."""
+        import aiohttp
         try:
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: requests.post(self.base_url, json=payload, timeout=60)
-            )
-            response.raise_for_status()
-            return response.json().get("response", "Error: Empty response.")
-        except requests.Timeout:
-            self.logger.warning("Ollama request timed out after 60s")
-            return "Kernel Error: Ollama timeout (60s). Model may be too slow or overloaded."
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"{self.base_url}/api/tags") as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        models = [m.get("name", "") for m in data.get("models", [])]
+                        if self.model in models:
+                            return True, f"Ollama online, model '{self.model}' ready"
+                        else:
+                            return False, f"Ollama online, but model '{self.model}' NOT FOUND. Run: ollama pull {self.model}"
+                    return False, f"Ollama returned status {resp.status}"
+        except aiohttp.ClientConnectorError:
+            return False, f"Cannot connect to Ollama at {self.base_url}. Is Ollama running? Run: ollama serve"
+        except Exception as e:
+            return False, f"Ollama check failed: {e}"
+
+    async def generate(self, prompt: str, system_prompt: str = "") -> str:
+        # Check Ollama health on first call
+        ok, msg = await self._check_ollama_running()
+        if not ok:
+            self.logger.error(msg)
+            return f"Kernel Error: {msg}"
+
+        full_prompt = f"System Context: {system_prompt}\n\nUser Command: {prompt}" if system_prompt else prompt
+        payload = {
+            "model": self.model,
+            "prompt": full_prompt,
+            "stream": False,
+            "options": {"temperature": 0.2}
+        }
+
+        import aiohttp
+        try:
+            timeout = aiohttp.ClientTimeout(total=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(self.generate_url, json=payload) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        return f"Kernel Error: Ollama HTTP {resp.status} — {text[:200]}"
+                    data = await resp.json()
+                    response_text = data.get("response", "").strip()
+                    if not response_text:
+                        return "Kernel Error: Ollama returned empty response."
+                    return response_text
+        except asyncio.TimeoutError:
+            self.logger.warning("Ollama request timed out after 120s")
+            return "Kernel Error: Ollama timeout (120s). Model may be too slow or overloaded. Try: ollama pull qwen2.5:3b (smaller model)"
         except Exception as e:
             self.logger.warning(f"Ollama error: {e}")
             return f"Kernel Error: {str(e)}"
@@ -187,7 +229,7 @@ class ACLController:
             return "CRITICAL ERROR: All cognitive centers offline."
 
 # ==========================================
-# 2. KERNEL MANAGER (v2 Integrated) — FIXED
+# 2. KERNEL MANAGER (v3 Integrated)
 # ==========================================
 class KernelManager:
     def __init__(self, config: ExArchonConfig):
@@ -202,8 +244,8 @@ class KernelManager:
         self.notice_system.register_aggregator("cortex", skill_aggregator)
         self.watchdog: Optional[SystemWatchdog] = None
         self.cap_manager = CapabilityManager()
+        self.monitor: Optional[LTLMonitor] = None
 
-        # === FIX: moved into __init__ ===
         self.metacognition = Metacognition(working_dir=self.config.working_dir)
         self.skill_miner = SkillMiner(
             hnma_controller=None,
@@ -213,7 +255,6 @@ class KernelManager:
         )
         self.sleep_cycle = None
         self._sleep_task = None
-        # ==================================
 
     async def init(self) -> str:
         if self._initialized:
@@ -267,18 +308,15 @@ class KernelManager:
         self.kernel.attach_capability_manager(self.cap_manager)
         self.kernel.attach_notice_system(self.notice_system)
 
-        # Wire self-awareness
         self.kernel.metacognition = self.metacognition
         self.kernel.skill_miner = self.skill_miner
 
-        # Set hnma_controller for skill_miner
         if hasattr(self.skill_miner, 'hnma_controller') and self.skill_miner.hnma_controller is None:
-            pass  # Will be bound below
+            pass
 
         if hasattr(self.kernel, 'skill_miner') and self.skill_miner:
             self.skill_miner.hnma = self.kernel.hnma
 
-        # Start sleep cycle
         self._sleep_task = asyncio.create_task(self._run_sleep_cycle())
 
         self.watchdog = SystemWatchdog(timeout_seconds=30.0)
@@ -286,7 +324,11 @@ class KernelManager:
         self.watchdog.start()
         self.logger.info("Hardware/Software watchdog started.")
 
-        # Memory budget check
+        # Safety Monitor
+        if self.config.enable_monitor:
+            self.monitor = create_default_monitor()
+            self.logger.info("LTL Safety Monitor active.")
+
         self._check_memory_budget()
 
         self._initialized = True
@@ -294,18 +336,22 @@ class KernelManager:
         return status_acl
 
     def _check_memory_budget(self):
-        """NEW: static memory budget enforcement"""
-        import psutil
-        process = psutil.Process(os.getpid())
-        mem_mb = process.memory_info().rss / (1024 * 1024)
-        if mem_mb > self.config.max_memory_mb:
-            self.logger.warning(f"Memory budget exceeded: {mem_mb:.1f}MB / {self.config.max_memory_mb}MB")
-            self.notice_system.post(
-                title="Memory Budget Exceeded",
-                message=f"Current: {mem_mb:.1f}MB, Limit: {self.config.max_memory_mb}MB",
-                severity="warning",
-                source="kernel",
-            )
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            mem_mb = process.memory_info().rss / (1024 * 1024)
+            if mem_mb > self.config.max_memory_mb:
+                self.logger.warning(f"Memory budget exceeded: {mem_mb:.1f}MB / {self.config.max_memory_mb}MB")
+                self.notice_system.post(
+                    title="Memory Budget Exceeded",
+                    message=f"Current: {mem_mb:.1f}MB, Limit: {self.config.max_memory_mb}MB",
+                    severity="warning",
+                    source="kernel",
+                )
+                if self.monitor:
+                    self.monitor.observe({"memory_usage": mem_mb})
+        except Exception as e:
+            self.logger.warning(f"Memory check failed: {e}")
 
     def _on_watchdog_panic(self):
         try:
@@ -315,6 +361,8 @@ class KernelManager:
                 severity="critical",
                 source="watchdog",
             )
+            if self.monitor:
+                self.monitor.observe({"watchdog_triggered": True})
         except Exception as e:
             self.logger.error(f"Watchdog panic handler failed: {e}")
 
@@ -433,6 +481,9 @@ async def sensory_loop(manager: KernelManager, console, shutdown_event: asyncio.
         if sensor_temp > 60 or sensor_temp < 10:
             manager.notice_system.feed_raw("sensory", raw_event)
 
+        if manager.monitor:
+            manager.monitor.observe({"temperature": sensor_temp})
+
         if manager.watchdog:
             manager.watchdog.pet()
 
@@ -504,6 +555,17 @@ async def get_capabilities():
     return {
         "components": manager.cap_manager.list_components(),
         "audit_preview": manager.cap_manager.get_audit_log(limit=20),
+    }
+
+@app.get("/health")
+async def health_check():
+    manager: KernelManager = app.state.manager
+    if not manager or not manager._initialized:
+        raise HTTPException(status_code=503, detail="Kernel not initialized")
+    return {
+        "status": "healthy",
+        "acl": manager.acl.primary_status if manager.acl else "unknown",
+        "monitor": manager.monitor.get_stats() if manager.monitor else None,
     }
 
 # ==========================================
@@ -591,21 +653,34 @@ async def local_cli_main():
     |  _|   \ V /  / /_\ \ | |_) | | |    | |_| | | | | | |  \| |
     | |___   > <   |  _  | |  _ <  | |___ |  _  | | |_| | | |\  |
     |_____|  /_/ \__\|_| |_| |_| \__\  \____||_| |_|  \___/  |_| \_|
-    [white]EXARCHON COGNITIVE OS LAYER // ALPHA v0.9.5[/white]
+    [white]EXARCHON COGNITIVE OS LAYER // ALPHA v1.0.0[/white]
     [/bold cyan]
     """
     console.print(logo)
+
+    # Show Ollama status clearly
+    ollama_status = " CONNECTED" if "ONLINE" in status_acl or "EDGE" in status_acl else " OFFLINE"
+
     console.print(Panel(
         f"● [bold white]ACL Layer:[/] {status_acl}\n"
+        f"● [bold white]Ollama:[/] {ollama_status}\n"
         f"● [bold white]Kernel:[/] READY (Raphael Edition)\n"
         f"● [bold white]Reflex System:[/] ONLINE\n"
         f"● [bold white]Notice System:[/] ACTIVE\n"
         f"● [bold white]Background Workers:[/] ACTIVE\n"
         f"● [bold white]Sensory Loop:[/] ACTIVE\n"
         f"● [bold white]Capability System:[/] ACTIVE\n"
+        f"● [bold white]Safety Monitor:[/] {'ACTIVE' if manager.monitor else 'DISABLED'}\n"
         f"● [bold white]Watchdog:[/] {'ACTIVE' if manager.watchdog else 'DISABLED'}",
         title="[bold white]System Status[/]", border_style="dim", expand=False
     ))
+
+    if "ERROR" in status_acl or "OFFLINE" in status_acl:
+        console.print("\n[bold red]  WARNING: Ollama is not responding.[/]")
+        console.print("[yellow]   Make sure Ollama is running:[/]")
+        console.print("[dim]   ollama serve[/]")
+        console.print("[dim]   ollama pull qwen2.5:7b[/]")
+        console.print("")
 
     shutdown_event = asyncio.Event()
 

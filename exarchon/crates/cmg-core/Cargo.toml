@@ -1,9 +1,14 @@
 [package]
 name = "cmg-core"
-version = "1.0.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-blake3 = "1"
-thiserror = "1"
+serde = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

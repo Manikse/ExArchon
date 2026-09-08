@@ -1,35 +1,21 @@
-[package]
-name = "exarchon"
-version = "1.0.0"
-edition = "2021"
-
-[workspace-members]
-include = [
-  "crates/cmg-core",
-  "crates/cmg-storage",
-  "crates/cmg-planner",
-  "crates/cmg-verify",
-  "crates/cmg-sync",
-  "crates/cmg-hal",
-  "crates/exarchon-runtime",
-  "pycmg",
-  "exarchon-cli",
-  "exarchon-daemon",
+[workspace]
+resolver = "2"
+members = [
+    "crates/cmg-core",
+    "crates/cmg-storage",
+    "crates/cmg-vm",
 ]
 
-[[bin]]
-name = "exarchon-cli"
-path = "exarchon-cli/src/main.rs"
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+authors = ["Manikse <pavloblaida@gmail.com>"]
+license = "GPL-3.0"
+repository = "https://github.com/Manikse/ExArchon"
 
-[[bin]]
-name = "exarchon-daemon"
-path = "exarchon-daemon/src/main.rs"
-
-[dependencies]
-tokio = { version = "1", features = ["full"] }
+[workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-cbor = "0.13"
 blake3 = "1"
 thiserror = "1"
 log = "0.4"

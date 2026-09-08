@@ -6,6 +6,9 @@
 requests>=2.31.0
 python-dotenv>=1.0.0
 
+# ── HTTP Client ──
+aiohttp>=3.9.0
+
 # ── CLI & UI ──
 rich>=13.0.0
 
@@ -18,16 +21,16 @@ pydantic>=2.0.0
 uvicorn>=0.27.0
 
 # ── Memory & Storage ──
-# brotli is optional — falls back to zlib if unavailable
- brotli>=1.1.0
+brotli>=1.1.0
+zstd>=1.5.5
+sentence-transformers>=3.0.0
 
 # ── System Monitoring ──
-# psutil is optional — falls back to /proc/meminfo on Linux, estimate on Windows
- psutil>=5.9.0
+psutil>=5.9.0
 
 # ── Performance (optional, for later Cython build) ──
- cython>=3.0.0
+cython>=3.0.0
 
 # ── Development ──
- pytest>=8.0.0
- pytest-asyncio>=0.23.0
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
