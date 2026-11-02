@@ -152,7 +152,7 @@ Action: terminal
 Action Input: df -h
 Observation: /dev/sda1  100G  45G  55G  45% /
 Action: respond
-Action Input: Disk usage: 45% used, 55% free.
+Action Input: Disk usage: 45% used, 55% free
 [Skill compiled and saved]
 ```
 
