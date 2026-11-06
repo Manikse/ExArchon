@@ -23,7 +23,7 @@
 
 ## Core Architecture
 
-> 📖 For an in-depth technical breakdown of the system's cognitive framework and execution loop, please refer to the [Architecture Documentation](docs/architecture.md).
+> 📖 For an in-depth technical breakdown of the system's cognitive framework and execution loop, please refer to the [Architecture Documentation](docs/architecture.md)
 
 ## Vision
 
